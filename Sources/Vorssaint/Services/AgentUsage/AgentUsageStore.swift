@@ -26,7 +26,7 @@ final class AgentUsageStore {
     /// session an agent moved to its archive, not news.
     static let lateEnd: TimeInterval = 5 * 60
     /// How long a quiet turn waits for its work to resume before it is over.
-    /// A new Codex task always opens a turn of its own, but a Claude session
+    /// A new Codex or Copilot task always opens a turn of its own, but a Claude session
     /// resumed after its process was killed reads like work going on, so a
     /// Claude turn waits only an hour.
     static func resumeWindow(for provider: AgentProvider) -> TimeInterval {
@@ -71,6 +71,17 @@ final class AgentUsageStore {
                 turns[file] = AgentLiveSession(id: file, provider: provider, started: date,
                                                lastActivity: max(date, turns[file]?.lastActivity ?? date),
                                                model: "", project: "", tokens: AgentTokens(), cost: 0)
+            case .turnContext(let model, let project):
+                guard tracksTurns else { continue }
+                if var turn = turns[file] {
+                    if !model.isEmpty { turn.model = model }
+                    if !project.isEmpty { turn.project = project }
+                    turns[file] = turn
+                } else if var turn = waiting[file] {
+                    if !model.isEmpty { turn.model = model }
+                    if !project.isEmpty { turn.project = project }
+                    waiting[file] = turn
+                }
             case .turnActive(let date):
                 guard tracksTurns else { continue }
                 let moment = date ?? modified
@@ -208,7 +219,8 @@ struct AgentLogRoot: Equatable {
     /// link elsewhere, as dotfile setups do, would otherwise never match.
     static func all(home: URL = FileManager.default.homeDirectoryForCurrentUser) -> [AgentLogRoot] {
         [(AgentProvider.claude, ".claude/projects"), (.claude, ".config/claude/projects"),
-         (.codex, ".codex/sessions"), (.codex, ".codex/archived_sessions")].map { provider, path in
+         (.codex, ".codex/sessions"), (.codex, ".codex/archived_sessions"),
+         (.copilot, ".copilot/session-state")].map { provider, path in
             AgentLogRoot(provider: provider, url: canonical(home.appending(path: path, directoryHint: .isDirectory)))
         }
     }
@@ -264,6 +276,7 @@ enum AgentLogReader {
     /// A line longer than this is a pasted file or a tool's output, never a
     /// usage record; it is skipped rather than held in memory.
     static let maximumLine = 32 << 20
+    private static let copilotHistoryMarker = Data(#""type":"session."#.utf8)
 
     static func isLog(_ path: String) -> Bool { path.hasSuffix(".jsonl") }
 
@@ -273,14 +286,27 @@ enum AgentLogReader {
     static func discover(_ roots: [AgentLogRoot], since horizon: Date) -> [(path: String, provider: AgentProvider)] {
         var found: [(path: String, provider: AgentProvider, modified: Date, subagent: Bool)] = []
         let keys: [URLResourceKey] = [.contentModificationDateKey, .isRegularFileKey]
+        func include(_ url: URL, from root: AgentLogRoot) {
+            guard let values = try? url.resourceValues(forKeys: Set(keys)), values.isRegularFile == true,
+                  let modified = values.contentModificationDate, modified >= horizon else { return }
+            let subagent = root.provider == .claude && AgentLogCursor.parent(of: url.path) != nil
+            found.append((url.path, root.provider, modified, subagent))
+        }
         for root in roots where root.exists {
+            // A Copilot session can contain a complete workspace checkout,
+            // databases and checkpoints. Its log has one fixed shallow path;
+            // recursively walking the workspace can delay the first snapshot
+            // indefinitely on a large repository.
+            if root.provider == .copilot {
+                let sessions = (try? FileManager.default.contentsOfDirectory(
+                    at: root.url, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles])) ?? []
+                for session in sessions { include(session.appending(path: "events.jsonl"), from: root) }
+                continue
+            }
             guard let enumerator = FileManager.default.enumerator(at: root.url, includingPropertiesForKeys: keys,
                                                                   options: [.skipsPackageDescendants]) else { continue }
             for case let url as URL in enumerator where isLog(url.path) {
-                guard let values = try? url.resourceValues(forKeys: Set(keys)), values.isRegularFile == true,
-                      let modified = values.contentModificationDate, modified >= horizon else { continue }
-                let subagent = root.provider == .claude && AgentLogCursor.parent(of: url.path) != nil
-                found.append((url.path, root.provider, modified, subagent))
+                include(url, from: root)
             }
         }
         return found.sorted { $0.subagent != $1.subagent ? $1.subagent : $0.modified < $1.modified }
@@ -290,6 +316,7 @@ enum AgentLogReader {
     /// Reads what was appended since the last call and hands over each
     /// complete line. A replaced or truncated file starts over.
     static func readAppended(_ cursor: AgentLogCursor, shouldContinue: () -> Bool = { true },
+                             including: ((Data, Range<Int>) -> Bool)? = nil,
                              line: (Data) -> Void) {
         guard shouldContinue() else { return }
         var info = stat()
@@ -315,14 +342,109 @@ enum AgentLogReader {
             let read: Bool = autoreleasepool {
                 guard let chunk = try? handle.read(upToCount: wanted), !chunk.isEmpty else { return false }
                 cursor.offset += UInt64(chunk.count)
-                split(chunk, cursor: cursor, line: line)
+                split(chunk, cursor: cursor, including: including, line: line)
                 return true
             }
             guard read else { break }
         }
     }
 
-    private static func split(_ chunk: Data, cursor: AgentLogCursor, line: (Data) -> Void) {
+    /// The first Copilot pass needs session metadata and counters, not the
+    /// potentially enormous prompt, reply and tool payloads between them.
+    /// The exact unescaped structural key cannot match quoted message text.
+    static func copilotHistoryLine(_ buffer: Data, range: Range<Int>) -> Bool {
+        buffer.range(of: copilotHistoryMarker, options: [], in: range) != nil
+    }
+
+    /// Restores a Copilot session from its small opening metadata and final
+    /// cumulative checkpoints. Session logs embed whole conversations and
+    /// workspace tool output between those edges; rereading that private,
+    /// irrelevant payload on every launch makes startup proportional to the
+    /// archive's size instead of the number of sessions.
+    static func readCopilotHistory(_ cursor: AgentLogCursor, shouldContinue: () -> Bool = { true },
+                                   line: (Data) -> Void) {
+        guard shouldContinue() else { return }
+        var info = stat()
+        guard stat(cursor.path, &info) == 0, (info.st_mode & S_IFMT) == S_IFREG else { return }
+        let size = UInt64(max(0, info.st_size))
+        let identity = UInt64(info.st_ino)
+        cursor.modified = Date(timeIntervalSince1970: TimeInterval(info.st_mtimespec.tv_sec)
+                                + TimeInterval(info.st_mtimespec.tv_nsec) / 1_000_000_000)
+        if identity != cursor.identity || size < cursor.offset { cursor.state = AgentLogState() }
+        cursor.identity = identity
+        cursor.offset = 0
+        cursor.pending = Data()
+        cursor.discarding = false
+        guard size > 0, let handle = FileHandle(forReadingAtPath: cursor.path) else { return }
+        defer { try? handle.close() }
+
+        // Small logs already fit in the ordinary streaming path, which also
+        // preserves a final line that is still being written.
+        let edge = UInt64(chunkSize)
+        if size <= edge * 2 {
+            readAppended(cursor, shouldContinue: shouldContinue, including: copilotHistoryLine, line: line)
+            return
+        }
+
+        guard let prefix = try? handle.read(upToCount: Int(edge)), !prefix.isEmpty,
+              shouldContinue() else { return }
+        emitCompleteLines(prefix, from: 0, including: copilotHistoryLine, line: line)
+
+        // Read one byte before the tail so a newline there proves that the
+        // following byte begins a complete line; otherwise discard the first
+        // tail fragment through its newline.
+        let readOffset = size - edge - 1
+        do { try handle.seek(toOffset: readOffset) } catch { return }
+        guard let tail = try? handle.read(upToCount: Int(edge) + 1), !tail.isEmpty,
+              shouldContinue() else { return }
+        let start: Int
+        if tail[tail.startIndex] == 0x0A {
+            start = 1
+        } else if let newline = tail.firstIndex(of: 0x0A) {
+            start = newline + 1
+        } else {
+            // The tail is one continued oversized line. Its eventual newline
+            // must be discarded when more bytes arrive.
+            cursor.offset = size
+            cursor.discarding = true
+            return
+        }
+        let trailing = emitCompleteLines(tail, from: start, including: copilotHistoryLine, line: line)
+        let remainder = tail.count - trailing
+        if remainder > maximumLine {
+            cursor.discarding = true
+        } else if remainder > 0 {
+            cursor.pending = tail.subdata(in: trailing..<tail.count)
+        }
+        cursor.offset = size
+    }
+
+    /// Emits newline-terminated ranges and returns the start of a trailing
+    /// incomplete line.
+    @discardableResult
+    private static func emitCompleteLines(_ buffer: Data, from initial: Int,
+                                          including: (Data, Range<Int>) -> Bool,
+                                          line: (Data) -> Void) -> Int {
+        var start = initial
+        let count = buffer.count
+        buffer.withUnsafeBytes { raw in
+            guard let base = raw.baseAddress else { return }
+            var position = initial
+            while position < count, let found = memchr(base + position, 0x0A, count - position) {
+                let end = base.distance(to: UnsafeRawPointer(found))
+                let range = start..<end
+                if !range.isEmpty, range.count <= maximumLine, including(buffer, range) {
+                    line(buffer.subdata(in: range))
+                }
+                start = end + 1
+                position = start
+            }
+        }
+        return start
+    }
+
+    private static func split(_ chunk: Data, cursor: AgentLogCursor,
+                              including: ((Data, Range<Int>) -> Bool)?, line: (Data) -> Void) {
         var buffer = cursor.pending
         buffer.append(chunk)
         var start = 0
@@ -343,7 +465,9 @@ enum AgentLogReader {
                 cursor.discarding = false
                 continue
             }
-            if !range.isEmpty, range.count <= maximumLine { line(buffer.subdata(in: range)) }
+            if !range.isEmpty, range.count <= maximumLine, including?(buffer, range) != false {
+                line(buffer.subdata(in: range))
+            }
         }
         // Once a line is oversized, scan only for its terminator. Retaining
         // subsequent fragments would rebuild a buffer we can never deliver.

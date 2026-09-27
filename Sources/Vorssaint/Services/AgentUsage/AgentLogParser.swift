@@ -13,6 +13,9 @@ enum AgentLogEntry: Equatable {
     case limits(AgentLimits)
     case plan(String, observedAt: Date)
     case turnBegan(Date)
+    /// Model and folder context that can be known before a provider reports
+    /// usage for the turn.
+    case turnContext(model: String, project: String)
     /// Work continues; nil when the line was not worth decoding for its time.
     case turnActive(Date?)
     case turnEnded(Date?, completed: Bool, duration: TimeInterval?)
@@ -30,6 +33,10 @@ struct AgentLogState: Equatable {
     var lastTotal: AgentTokens?
     /// Codex runs the thread on the fast tier, which bills at a premium.
     var fast = false
+    /// Copilot shutdown counters are cumulative for the life of a session.
+    var copilotTotals: [String: AgentTokens] = [:]
+    /// Copilot repeats its cumulative premium-request count at checkpoints.
+    var copilotPremiumRequests = 0
 }
 
 enum AgentLogParser {
@@ -261,6 +268,139 @@ enum AgentLogParser {
         let written = min(input - cached, int(usage["cache_write_input_tokens"]))
         return AgentTokens(input: input - cached - written, cacheWrite: written, cacheRead: cached,
                            output: int(usage["output_tokens"]), reasoning: int(usage["reasoning_output_tokens"]))
+    }
+
+    // MARK: GitHub Copilot
+
+    /// Copilot CLI and the GitHub Copilot app share an append-only event log.
+    /// Only session context, turn boundaries and cumulative model counters are
+    /// decoded; prompts, replies, reasoning and tool arguments are ignored.
+    static func parseCopilot(_ line: Data, state: inout AgentLogState, now: Date) -> [AgentLogEntry] {
+        let relevant = contains(line, #""type":"session.start""#)
+            || contains(line, #""type":"session.model_change""#)
+            || contains(line, #""type":"user.message""#)
+            || contains(line, #""type":"assistant.message""#)
+            || contains(line, #""type":"session.usage_checkpoint""#)
+            || contains(line, #""type":"session.task_complete""#)
+            || contains(line, #""type":"session.shutdown""#)
+            || contains(line, #""type":"abort""#)
+        guard relevant, let json = object(line), let type = json["type"] as? String else { return [] }
+        let data = json["data"] as? [String: Any] ?? [:]
+        let date = timestamp(json["timestamp"]) ?? now
+
+        switch type {
+        case "session.start":
+            if let session = data["sessionId"] as? String, !session.isEmpty {
+                state.session = native(session)
+            }
+            if let model = data["selectedModel"] as? String, !model.isEmpty {
+                state.model = native(model)
+            }
+            if let context = data["context"] as? [String: Any],
+               let path = ["gitRoot", "cwd", "repository"].compactMap({ context[$0] as? String }).first(where: { !$0.isEmpty }) {
+                state.project = projectName(path)
+            }
+            return []
+        case "session.model_change":
+            if let model = data["newModel"] as? String, !model.isEmpty { state.model = native(model) }
+            return []
+        case "user.message":
+            guard copilotRoot(json) else { return [] }
+            if state.turnOpen { return [.turnActive(date)] }
+            state.turnOpen = true
+            return [.turnBegan(date), .turnContext(model: state.model, project: state.project)]
+        case "assistant.message":
+            guard copilotRoot(json) else { return [] }
+            if let model = data["model"] as? String, !model.isEmpty { state.model = native(model) }
+            return state.turnOpen ? [.turnContext(model: state.model, project: state.project), .turnActive(date)] : []
+        case "session.usage_checkpoint":
+            guard copilotRoot(json) else { return [] }
+            let endedTurn = state.turnOpen
+            state.turnOpen = false
+            let requests: Int
+            if data["totalPremiumRequests"] != nil {
+                let total = int(data["totalPremiumRequests"])
+                requests = max(0, total - state.copilotPremiumRequests)
+                state.copilotPremiumRequests = max(state.copilotPremiumRequests, total)
+            } else {
+                requests = 1
+            }
+            let checkpoint = (json["id"] as? String).flatMap { $0.isEmpty ? nil : native($0) }
+                ?? String(date.timeIntervalSince1970)
+            var entries: [AgentLogEntry] = []
+            if requests > 0 {
+                let activity = AgentUsageRecord(provider: .copilot, date: date, model: state.model,
+                                                project: state.project, session: state.session, requests: requests,
+                                                tokens: AgentTokens(), cost: 0, savings: 0)
+                entries.append(.usage(key: "copilot:\(state.session):\(checkpoint):activity", record: activity,
+                                      billable: AgentBillable()))
+            }
+            if endedTurn { entries.append(.turnEnded(date, completed: true, duration: nil)) }
+            return entries
+        case "session.task_complete":
+            guard state.turnOpen else { return [] }
+            state.turnOpen = false
+            return [.turnEnded(date, completed: data["success"] as? Bool != false, duration: nil)]
+        case "abort":
+            guard state.turnOpen else { return [] }
+            state.turnOpen = false
+            return [.turnEnded(date, completed: false, duration: nil)]
+        case "session.shutdown":
+            var entries = copilotUsage(data["modelMetrics"] as? [String: Any], event: json["id"] as? String,
+                                       date: date, state: &state)
+            if state.turnOpen {
+                state.turnOpen = false
+                entries.append(.turnEnded(date, completed: false, duration: nil))
+            }
+            return entries
+        default:
+            return []
+        }
+    }
+
+    /// Root events omit agentId; subagent events in the same file carry one.
+    private static func copilotRoot(_ json: [String: Any]) -> Bool {
+        (json["agentId"] as? String)?.isEmpty != false
+    }
+
+    private static func copilotUsage(_ metrics: [String: Any]?, event: String?, date: Date,
+                                     state: inout AgentLogState) -> [AgentLogEntry] {
+        guard let metrics else { return [] }
+        var entries: [AgentLogEntry] = []
+        for model in metrics.keys.sorted() {
+            guard let metric = metrics[model] as? [String: Any] else { continue }
+            let total = copilotTokens(metric)
+            let previous = state.copilotTotals[model]
+            let tokens = tokenGrowth(total, after: previous)
+            state.copilotTotals[model] = total
+            guard tokens.total > 0 else { continue }
+            let billable = AgentBillable(tokens: tokens)
+            let name = native(model)
+            let priced = AgentPricing.cost(billable, model: name)
+            let checkpoint = event.flatMap { $0.isEmpty ? nil : native($0) }
+                ?? String(date.timeIntervalSince1970)
+            entries.append(.usage(key: "copilot:\(state.session):\(checkpoint):\(name)", record: AgentUsageRecord(
+                provider: .copilot, date: date, model: name, project: state.project, session: state.session,
+                requests: 0, tokens: tokens, cost: priced.cost, savings: priced.savings), billable: billable))
+        }
+        return entries
+    }
+
+    private static func copilotTokens(_ metric: [String: Any]) -> AgentTokens {
+        let details = metric["tokenDetails"] as? [String: Any] ?? [:]
+        func count(_ key: String) -> Int { int((details[key] as? [String: Any])?["tokenCount"]) }
+        return AgentTokens(input: count("input"), cacheWrite: count("cache_write"), cacheRead: count("cache_read"),
+                           output: count("output"),
+                           reasoning: int((metric["usage"] as? [String: Any])?["reasoningTokens"]))
+    }
+
+    private static func tokenGrowth(_ total: AgentTokens, after previous: AgentTokens?) -> AgentTokens {
+        guard let previous, total.total >= previous.total else { return total }
+        return AgentTokens(input: max(0, total.input - previous.input),
+                           cacheWrite: max(0, total.cacheWrite - previous.cacheWrite),
+                           cacheRead: max(0, total.cacheRead - previous.cacheRead),
+                           output: max(0, total.output - previous.output),
+                           reasoning: max(0, total.reasoning - previous.reasoning))
     }
 
     /// Codex logs a reading for each allowance: the main one under "codex",

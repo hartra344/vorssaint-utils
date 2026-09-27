@@ -10,9 +10,21 @@ typealias AgentUsageProductionLogReader = AgentLogReader
 enum AgentUsageReadTests {
     enum AgentLogReader {
         static var beforeLine: (() -> Void)?
+        static func copilotHistoryLine(_ buffer: Data, range: Range<Int>) -> Bool {
+            AgentUsageProductionLogReader.copilotHistoryLine(buffer, range: range)
+        }
+        static func readCopilotHistory(_ cursor: AgentLogCursor, shouldContinue: () -> Bool,
+                                       line: (Data) -> Void) {
+            AgentUsageProductionLogReader.readCopilotHistory(cursor, shouldContinue: shouldContinue) {
+                beforeLine?()
+                line($0)
+            }
+        }
         static func readAppended(_ cursor: AgentLogCursor, shouldContinue: () -> Bool,
+                                 including: ((Data, Range<Int>) -> Bool)? = nil,
                                  line: (Data) -> Void) {
-            AgentUsageProductionLogReader.readAppended(cursor, shouldContinue: shouldContinue) {
+            AgentUsageProductionLogReader.readAppended(cursor, shouldContinue: shouldContinue,
+                                                        including: including) {
                 beforeLine?()
                 line($0)
             }
@@ -56,6 +68,14 @@ enum AgentUsageReadTests {
                 #"{"type":"token_usage_record","timestamp":\#(timestamp),"payload":{"response_id":"r","usage":{"input_tokens":10,"output_tokens":5}}}"#,
                 #"{"type":"event_msg","timestamp":\#(timestamp),"payload":{"type":"token_count","rate_limits":{"plan_type":"pro","primary":{"used_percent":42,"window_minutes":300}}}}"#,
                 #"{"type":"event_msg","timestamp":\#(timestamp),"payload":{"type":"task_complete","duration_ms":20000}}"#
+            ]),
+            (.copilot, [
+                #"{"id":"start","timestamp":\#(timestamp),"type":"session.start","data":{"sessionId":"s","selectedModel":"gpt-6-sol","context":{"cwd":"/tmp/example"}}}"#,
+                #"{"id":"turn","timestamp":\#(timestamp),"type":"user.message","data":{"turnId":"0","content":"private"}}"#,
+                #"{"id":"message","timestamp":\#(timestamp),"type":"assistant.message","data":{"model":"gpt-6-sol","content":"private"}}"#,
+                #"{"id":"end","timestamp":\#(timestamp),"type":"session.usage_checkpoint","data":{"totalPremiumRequests":1}}"#,
+                #"{"id":"usage","timestamp":\#(timestamp),"type":"session.shutdown","data":{"modelMetrics":{"gpt-6-sol":{"requests":{"count":1},"tokenDetails":{"input":{"tokenCount":10},"cache_read":{"tokenCount":20},"cache_write":{"tokenCount":0},"output":{"tokenCount":5}},"usage":{"reasoningTokens":2}}}}}"#,
+                #"{"id":"checkpoint","timestamp":\#(timestamp),"type":"session.usage_checkpoint","data":{}}"#
             ])
         ]
         for (provider, lines) in cases {
@@ -66,11 +86,17 @@ enum AgentUsageReadTests {
 
             let cursor = AgentLogCursor(path: file.path, provider: provider)
             var entries: [AgentLogEntry] = []
-            AgentUsageProductionLogReader.readAppended(cursor) { line in
+            let consume: (Data) -> Void = { line in
                 switch provider {
                 case .claude: entries += AgentLogParser.parseClaude(line, state: &cursor.state, now: now)
                 case .codex: entries += AgentLogParser.parseCodex(line, state: &cursor.state, now: now)
+                case .copilot: entries += AgentLogParser.parseCopilot(line, state: &cursor.state, now: now)
                 }
+            }
+            if provider == .copilot {
+                AgentUsageProductionLogReader.readCopilotHistory(cursor, line: consume)
+            } else {
+                AgentUsageProductionLogReader.readAppended(cursor, line: consume)
             }
             let reference = AgentUsageStore()
             reference.reportsTransitions = true
@@ -89,8 +115,9 @@ enum AgentUsageReadTests {
                             && host.store.waiting == reference.waiting && host.store.limits == reference.limits
                             && host.store.codexPlan == reference.codexPlan && host.events == expectedEvents,
                          "streaming \(provider.rawValue) preserves duplicate merging, usage, turns, limits, plans and event order")
-            suite.expect(!expectedEvents.isEmpty && host.cursors[file.path]?.state == cursor.state,
-                         "\(provider.rawValue) finishes the same turn and retains the same parser context")
+            suite.expect((provider == .copilot || !expectedEvents.isEmpty)
+                            && host.cursors[file.path]?.state == cursor.state,
+                         "\(provider.rawValue) retains the same parser context without replaying historical finishes")
             suite.expect(!host.read(file.path, provider: provider) && host.events == expectedEvents,
                          "an unchanged \(provider.rawValue) file neither changes the store nor replays events")
             host.readerCancellation?.isCancelled = true

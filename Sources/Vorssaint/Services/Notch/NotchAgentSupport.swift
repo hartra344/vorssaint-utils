@@ -71,7 +71,11 @@ enum NotchAgentSupport {
     }
 
     static func key(for provider: AgentProvider) -> String {
-        provider == .claude ? DefaultsKey.notchAgentsClaude : DefaultsKey.notchAgentsCodex
+        switch provider {
+        case .claude: DefaultsKey.notchAgentsClaude
+        case .codex: DefaultsKey.notchAgentsCodex
+        case .copilot: DefaultsKey.notchAgentsCopilot
+        }
     }
 
     /// Every card in the saved order; cards added later join at the end.
@@ -180,7 +184,7 @@ enum NotchAgentSupport {
 
     static func tiles(cards: [NotchAgentCard], providers: [AgentProvider]) -> [NotchAgentTile] {
         cards.flatMap { card -> [NotchAgentTile] in
-            card == .limits ? providers.map { NotchAgentTile(card: .limits, provider: $0) }
+            card == .limits ? providers.filter(\.reportsLimits).map { NotchAgentTile(card: .limits, provider: $0) }
                 : [NotchAgentTile(card: card, provider: nil)]
         }
     }
