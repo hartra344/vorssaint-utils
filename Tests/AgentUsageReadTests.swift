@@ -73,9 +73,10 @@ enum AgentUsageReadTests {
                 #"{"id":"start","timestamp":\#(timestamp),"type":"session.start","data":{"sessionId":"s","selectedModel":"gpt-6-sol","context":{"cwd":"/tmp/example"}}}"#,
                 #"{"id":"turn","timestamp":\#(timestamp),"type":"user.message","data":{"turnId":"0","content":"private"}}"#,
                 #"{"id":"message","timestamp":\#(timestamp),"type":"assistant.message","data":{"model":"gpt-6-sol","content":"private"}}"#,
-                #"{"id":"end","timestamp":\#(timestamp),"type":"session.usage_checkpoint","data":{"totalPremiumRequests":1}}"#,
+                #"{"id":"checkpoint","timestamp":\#(timestamp),"type":"session.usage_checkpoint","data":{"totalPremiumRequests":1}}"#,
+                #"{"id":"end","timestamp":\#(timestamp),"type":"assistant.turn_end","data":{"turnId":"0"}}"#,
                 #"{"id":"usage","timestamp":\#(timestamp),"type":"session.shutdown","data":{"modelMetrics":{"gpt-6-sol":{"requests":{"count":1},"tokenDetails":{"input":{"tokenCount":10},"cache_read":{"tokenCount":20},"cache_write":{"tokenCount":0},"output":{"tokenCount":5}},"usage":{"reasoningTokens":2}}}}}"#,
-                #"{"id":"checkpoint","timestamp":\#(timestamp),"type":"session.usage_checkpoint","data":{}}"#
+                #"{"id":"final-checkpoint","timestamp":\#(timestamp),"type":"session.usage_checkpoint","data":{}}"#
             ])
         ]
         for (provider, lines) in cases {
@@ -128,24 +129,26 @@ enum AgentUsageReadTests {
         let openLines = [
             #"{"id":"start","timestamp":"2026-09-27T15:00:00.000Z","type":"session.start","data":{"sessionId":"open","selectedModel":"gpt-6-sol","context":{"cwd":"/tmp/open-project"}}}"#,
             #"{"id":"turn","timestamp":"2026-09-27T15:01:00.000Z","type":"user.message","data":{"content":"still working"}}"#,
-            #"{"id":"reply","timestamp":"2026-09-27T15:01:30.000Z","type":"assistant.message","data":{"model":"gpt-6-sol","content":"in progress"}}"#
+            #"{"id":"reply","timestamp":"2026-09-27T15:01:30.000Z","type":"assistant.message","data":{"model":"gpt-6-sol","content":"in progress"}}"#,
+            #"{"id":"checkpoint","timestamp":"2026-09-27T15:01:45.000Z","type":"session.usage_checkpoint","data":{"totalPremiumRequests":0}}"#
         ]
         try? Data((openLines.joined(separator: "\n") + "\n").utf8).write(to: openFile)
         let openHost = Host()
         suite.expect(openHost.read(openFile.path, provider: .copilot)
                         && openHost.store.turns[openFile.path]?.project == "open-project"
                         && openHost.store.turns[openFile.path]?.model == "gpt-6-sol"
-                        && openHost.cursors[openFile.path]?.state.turnOpen == true,
-                     "an existing Copilot log restores the currently open turn on startup")
+                        && openHost.cursors[openFile.path]?.state.turnOpen == true
+                        && openHost.store.records.count == 1,
+                     "startup restores a Copilot turn that remains open after an intermediate checkpoint")
         if let handle = try? FileHandle(forWritingTo: openFile) {
             _ = try? handle.seekToEnd()
-            try? handle.write(contentsOf: Data((#"{"id":"end","timestamp":"2026-09-27T15:02:00.000Z","type":"session.usage_checkpoint","data":{"totalPremiumRequests":0}}"# + "\n").utf8))
+            try? handle.write(contentsOf: Data((#"{"id":"end","timestamp":"2026-09-27T15:02:00.000Z","type":"assistant.turn_end","data":{"turnId":"0"}}"# + "\n").utf8))
             try? handle.close()
         }
         openHost.store.reportsTransitions = true
         suite.expect(openHost.read(openFile.path, provider: .copilot)
                         && openHost.cursors[openFile.path]?.state.turnOpen == false
                         && openHost.store.turns[openFile.path] == nil,
-                     "the restored Copilot turn finishes when its next checkpoint arrives")
+                     "the restored Copilot turn finishes when its root assistant turn-end arrives")
     }
 }

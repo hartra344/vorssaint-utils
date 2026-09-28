@@ -278,7 +278,8 @@ enum AgentLogReader {
     static let maximumLine = 32 << 20
     private static let copilotHistoryMarkers = [
         Data(#""type":"session."#.utf8), Data(#""type":"user.message""#.utf8),
-        Data(#""type":"assistant.message""#.utf8), Data(#""type":"abort""#.utf8)
+        Data(#""type":"assistant.message""#.utf8), Data(#""type":"assistant.turn_end""#.utf8),
+        Data(#""type":"abort""#.utf8)
     ]
 
     static func isLog(_ path: String) -> Bool { path.hasSuffix(".jsonl") }

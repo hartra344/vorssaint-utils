@@ -310,21 +310,22 @@ enum AgentLogParser {
             if let model = string(line, after: #""model":""#), !model.isEmpty { state.model = native(model) }
             return state.turnOpen ? [.turnContext(model: state.model, project: state.project), .turnActive(date)] : []
         }
+        if contains(line, #""type":"assistant.turn_end""#) {
+            guard copilotRoot(line), state.turnOpen else { return [] }
+            state.turnOpen = false
+            return [.turnEnded(copilotTimestamp(line, now: now), completed: true, duration: nil)]
+        }
         if contains(line, #""type":"session.usage_checkpoint""#) {
             guard copilotRoot(line) else { return [] }
             let date = copilotTimestamp(line, now: now)
-            let endedTurn = state.turnOpen
-            state.turnOpen = false
             let checkpoint = string(line, after: #""id":""#).flatMap { $0.isEmpty ? nil : native($0) }
                 ?? String(date.timeIntervalSince1970)
             let activity = AgentUsageRecord(provider: .copilot, date: date, model: state.model,
                                             project: state.project, session: state.session,
                                             tokens: AgentTokens(), cost: 0, savings: 0)
-            var entries: [AgentLogEntry] = [.usage(
+            return [.usage(
                 key: "copilot:\(state.session):\(checkpoint):activity", record: activity,
                 billable: AgentBillable())]
-            if endedTurn { entries.append(.turnEnded(date, completed: true, duration: nil)) }
-            return entries
         }
         let relevant = contains(line, #""type":"session.start""#)
             || contains(line, #""type":"session.model_change""#)

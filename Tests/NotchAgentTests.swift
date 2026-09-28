@@ -456,14 +456,24 @@ enum NotchAgentTests {
         suite.expect(feed(#"{"id":"helper","timestamp":"2026-09-27T15:01:01.000Z","type":"user.message","agentId":"helper","data":{"turnId":"0","content":"never decoded"}}"#).isEmpty,
                      "a Copilot subagent in the shared event log does not replace the root turn")
         _ = feed(#"{"id":"reply","timestamp":"2026-09-27T15:01:30.000Z","type":"assistant.message","data":{"model":"gpt-6-sol","content":"never decoded"}}"#)
-        let finished = feed(#"{"id":"end","timestamp":"2026-09-27T15:03:00.000Z","type":"session.usage_checkpoint","data":{"totalPremiumRequests":1}}"#)
-        suite.expect(finished == [.finished(provider: .copilot, duration: 120, cost: 0, tokens: 0, project: "app")]
-                        && state.session == "cp1" && state.project == "app" && state.model == "gpt-6-sol",
-                     "Copilot session context and task checkpoints drive live work without reading message content")
+        let checkpointEvents = feed(#"{"id":"checkpoint","timestamp":"2026-09-27T15:02:00.000Z","type":"session.usage_checkpoint","data":{"totalPremiumRequests":1}}"#)
+        suite.expect(checkpointEvents.isEmpty && state.turnOpen && state.session == "cp1"
+                        && state.project == "app" && state.model == "gpt-6-sol",
+                     "Copilot usage checkpoints record activity without closing the root turn")
         let requestsBefore = store.records.reduce(0, { $0 + $1.requests })
         let repeated = feed(#"{"id":"repeat","timestamp":"2026-09-27T15:03:01.000Z","type":"session.usage_checkpoint","data":{"totalPremiumRequests":1}}"#)
-        suite.expect(repeated.isEmpty && store.records.reduce(0, { $0 + $1.requests }) == requestsBefore + 1,
+        suite.expect(repeated.isEmpty && state.turnOpen
+                        && store.records.reduce(0, { $0 + $1.requests }) == requestsBefore + 1,
                      "Copilot activity follows model checkpoints, independently of premium billing increments")
+        suite.expect(feed(#"{"id":"end","timestamp":"2026-09-27T15:03:02.000Z","type":"assistant.turn_end","data":{"turnId":"0"}}"#)
+                        == [.finished(provider: .copilot, duration: 122, cost: 0, tokens: 0, project: "app")]
+                        && !state.turnOpen,
+                     "Copilot's root assistant turn-end event completes live work after intermediate checkpoints")
+        var helperTurn = AgentLogState(turnOpen: true)
+        suite.expect(AgentLogParser.parseCopilot(
+            line(#"{"id":"helper-end","timestamp":"2026-09-27T15:03:03.000Z","type":"assistant.turn_end","agentId":"helper","data":{"turnId":"0"}}"#),
+            state: &helperTurn, now: now).isEmpty && helperTurn.turnOpen,
+                     "a Copilot subagent turn-end never closes the root turn")
 
         let first = #"{"id":"usage-1","timestamp":"2026-09-27T15:04:00.000Z","type":"session.shutdown","data":{"modelMetrics":{"gpt-6-sol":{"requests":{"count":2,"cost":1},"tokenDetails":{"input":{"tokenCount":10},"cache_read":{"tokenCount":20},"cache_write":{"tokenCount":5},"output":{"tokenCount":7}},"usage":{"reasoningTokens":3}}}}}"#
         let second = #"{"id":"usage-2","timestamp":"2026-09-27T15:09:00.000Z","type":"session.shutdown","data":{"modelMetrics":{"gpt-6-sol":{"requests":{"count":3,"cost":2},"tokenDetails":{"input":{"tokenCount":15},"cache_read":{"tokenCount":30},"cache_write":{"tokenCount":5},"output":{"tokenCount":10}},"usage":{"reasoningTokens":4}}}}}"#
@@ -846,6 +856,7 @@ enum NotchAgentTests {
         let filteredLines = [
             #"{"type":"tool.execution_complete","data":{"content":"never decoded"}}"#,
             #"{"type":"assistant.message","data":{"content":"\"type\":\"session.shutdown\""}}"#,
+            #"{"type":"assistant.turn_end","data":{"turnId":"0"}}"#,
             #"{"type":"session.shutdown","data":{}}"#
         ]
         try? Data((filteredLines.joined(separator: "\n") + "\n").utf8).write(to: filtered)
@@ -854,7 +865,7 @@ enum NotchAgentTests {
         AgentLogReader.readAppended(filteredCursor, including: AgentLogReader.copilotHistoryLine) {
             historyLines.append(String(decoding: $0, as: UTF8.self))
         }
-        suite.expect(historyLines == Array(filteredLines.suffix(2)),
+        suite.expect(historyLines == Array(filteredLines.suffix(3)),
                      "Copilot's first pass keeps only session and live-turn structural lines")
         let edgeLog = copilotRoot.appending(path: "edge-events.jsonl")
         let edgeStart = #"{"type":"session.start","data":{"sessionId":"edge"}}"#
