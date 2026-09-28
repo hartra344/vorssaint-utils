@@ -10,6 +10,8 @@ import Foundation
 enum AgentLogEntry: Equatable {
     /// `key` identifies the response across duplicate lines and files.
     case usage(key: String, record: AgentUsageRecord, billable: AgentBillable)
+    /// A later chunk can identify the model of an already-counted request.
+    case usageModel(key: String, model: String)
     case limits(AgentLimits)
     case plan(String, observedAt: Date)
     case turnBegan(Date)
@@ -35,8 +37,10 @@ struct AgentLogState: Equatable {
     var fast = false
     /// Copilot shutdown counters are cumulative for the life of a session.
     var copilotTotals: [String: AgentTokens] = [:]
+    /// Counted requests by model; the empty key holds unresolved attribution.
     var copilotRequests: [String: Int] = [:]
-    var copilotMessages: Set<String> = []
+    var copilotRequestModels: [String: String] = [:]
+    var copilotReportedRequests: [String: Int] = [:]
     var copilotTurnID: String?
     var copilotFinalResponse = false
 }
@@ -280,7 +284,8 @@ enum AgentLogParser {
     static func parseCopilot(_ line: Data, state: inout AgentLogState, now: Date) -> [AgentLogEntry] {
         guard let envelope = AgentLogObject(line), let type = envelope.string("type"),
               copilotEvent(type), let data = envelope.object("data") else { return [] }
-        let root = envelope.string("agentId")?.isEmpty != false
+        let agent = envelope.string("agentId").flatMap { $0.isEmpty ? nil : $0 }
+        let root = agent == nil
         // Subagents share the root log. Their responses count as activity,
         // but their lifecycle and model changes never change the root task.
         guard root || type == "assistant.message" else { return [] }
@@ -294,17 +299,11 @@ enum AgentLogParser {
             state.turnOpen = true
             return [entry, .turnContext(model: state.model, project: state.project)]
         case "assistant.message":
-            let model = data.string("model").flatMap { $0.isEmpty ? nil : native($0) } ?? state.model
-            let message = data.string("messageId") ?? envelope.string("id") ?? String(date.timeIntervalSince1970)
-            var entries: [AgentLogEntry] = []
-            if state.copilotMessages.insert(message).inserted {
-                state.copilotRequests[model, default: 0] += 1
-                let activity = AgentUsageRecord(provider: .copilot, date: date, model: model,
-                                                project: state.project, session: state.session,
-                                                tokens: AgentTokens(), cost: 0, savings: 0)
-                entries.append(.usage(key: "copilot:\(state.session):\(message):activity",
-                                      record: activity, billable: AgentBillable(isAggregate: true)))
-            }
+            // A subagent can choose a different model; missing metadata is
+            // unknown, not evidence that it used the root's selected model.
+            let model = data.string("model").flatMap { $0.isEmpty ? nil : native($0) } ?? (root ? state.model : "")
+            var entries = copilotActivity(data, envelope: envelope, agent: agent, model: model,
+                                          date: date, state: &state)
             guard root else { return entries }
             state.model = model
             // Each tool iteration has its own turn_end. Only an iteration
@@ -365,23 +364,64 @@ enum AgentLogParser {
          "session.start", "session.context_changed", "session.model_change", "session.shutdown", "abort"].contains(type)
     }
 
+    private static func copilotActivity(_ data: AgentLogObject, envelope: AgentLogObject, agent: String?,
+                                        model: String, date: Date, state: inout AgentLogState) -> [AgentLogEntry] {
+        let call = data.string("apiCallId").flatMap { $0.isEmpty ? nil : $0 }
+        let message = data.string("messageId").flatMap { $0.isEmpty ? nil : $0 }
+            ?? envelope.string("id") ?? String(date.timeIntervalSince1970)
+        // Each API call can emit several messages. Older logs lack apiCallId,
+        // so they retain message-level deduplication. Namespace IDs by kind
+        // and agent so independent calls cannot collide with those fallbacks.
+        let request = (agent.map { "agent:\($0)" } ?? "root") + ":"
+            + (call.map { "api:\($0)" } ?? "message:\(message)")
+        let key = "copilot:\(state.session):\(request):activity"
+        if let previous = state.copilotRequestModels[request] {
+            guard previous.isEmpty, !model.isEmpty else { return [] }
+            state.copilotRequestModels[request] = model
+            state.copilotRequests[previous, default: 0] -= 1
+            state.copilotRequests[model, default: 0] += 1
+            return [.usageModel(key: key, model: model)]
+        }
+        state.copilotRequestModels[request] = model
+        state.copilotRequests[model, default: 0] += 1
+        return [.usage(key: key, record: AgentUsageRecord(
+            provider: .copilot, date: date, model: model, project: state.project, session: state.session,
+            tokens: AgentTokens(), cost: 0, savings: 0), billable: AgentBillable(isAggregate: true))]
+    }
+
     private static func copilotUsage(_ metrics: [String: Any]?, event: String?, date: Date,
                                      state: inout AgentLogState) -> [AgentLogEntry] {
         guard let metrics else { return [] }
-        var entries: [AgentLogEntry] = []
-        for model in metrics.keys.sorted() {
-            guard let metric = metrics[model] as? [String: Any] else { continue }
+        var growth: [String: AgentTokens] = [:]
+        for (model, value) in metrics {
+            guard let metric = value as? [String: Any] else { continue }
             let total = copilotTokens(metric)
-            let previous = state.copilotTotals[model]
-            let tokens = tokenGrowth(total, after: previous)
+            growth[model] = tokenGrowth(total, after: state.copilotTotals[model])
             state.copilotTotals[model] = total
-            let recorded = state.copilotRequests[model, default: 0]
             let reported = int((metric["requests"] as? [String: Any])?["count"])
-            // Responses retain their own dates. A partial or older log can
-            // still prove activity at shutdown even without those responses.
-            let requests = max(0, max(reported, tokens.total > 0 ? 1 : 0) - recorded)
-            state.copilotRequests[model] = recorded + requests
-            guard tokens.total > 0 || requests > 0 else { continue }
+            state.copilotReportedRequests[model] = max(state.copilotReportedRequests[model, default: 0],
+                                                       max(reported, total.total > 0 ? 1 : 0))
+        }
+        let deficits = state.copilotReportedRequests
+            .map { (model: $0.key, count: max(0, $0.value - state.copilotRequests[$0.key, default: 0])) }
+        let unresolved = state.copilotRequests["", default: 0]
+        var missing = max(0, deficits.reduce(0) { $0 + $1.count } - unresolved)
+        var requests: [String: Int] = [:]
+        // Unknown responses can cover any model's deficit, but only once
+        // across the whole session. Attribute only the excess that must be
+        // this model; retain ambiguous requests in the unknown bucket.
+        for deficit in deficits {
+            let certain = max(0, deficit.count - unresolved)
+            requests[deficit.model] = certain
+            missing -= certain
+        }
+        if missing > 0 { requests["", default: 0] += missing }
+        var entries: [AgentLogEntry] = []
+        for model in Set(growth.keys).union(requests.keys).sorted() {
+            let tokens = growth[model] ?? AgentTokens()
+            let count = requests[model, default: 0]
+            state.copilotRequests[model, default: 0] += count
+            guard tokens.total > 0 || count > 0 else { continue }
             let billable = AgentBillable(tokens: tokens, isAggregate: true)
             let name = native(model)
             let priced = AgentPricing.cost(billable, model: name)
@@ -389,7 +429,7 @@ enum AgentLogParser {
                 ?? String(date.timeIntervalSince1970)
             entries.append(.usage(key: "copilot:\(state.session):\(checkpoint):\(name)", record: AgentUsageRecord(
                 provider: .copilot, date: date, model: name, project: state.project, session: state.session,
-                requests: requests, tokens: tokens, cost: priced.cost, savings: priced.savings), billable: billable))
+                requests: count, tokens: tokens, cost: priced.cost, savings: priced.savings), billable: billable))
         }
         return entries
     }

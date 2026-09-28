@@ -54,6 +54,15 @@ final class AgentUsageStore {
                 // totals, neither of which measures the current root task.
                 let turn = provider == .copilot ? nil : tracksTurns ? file : parent
                 add(record, billable: billable, key: key, turn: turn, subagent: !tracksTurns)
+            case .usageModel(let key, let model):
+                guard let position = index[key], records[position].model.isEmpty else { continue }
+                let old = records[position]
+                records[position] = AgentUsageRecord(provider: old.provider, date: old.date, model: model,
+                    project: old.project, session: old.session, requests: old.requests,
+                    tokens: old.tokens, cost: old.cost, savings: old.savings)
+                // Incremental token updates keep the same model; attribution
+                // changes instead rebuild model buckets from the records.
+                summary.invalidate()
             case .limits(let reading):
                 if (limits[reading.provider]?.observedAt ?? .distantPast) <= reading.observedAt {
                     limits[reading.provider] = reading

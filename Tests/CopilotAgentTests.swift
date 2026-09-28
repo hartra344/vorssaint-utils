@@ -45,6 +45,92 @@ enum CopilotAgentTests {
         turns(suite)
         envelopes(suite)
         accounting(suite)
+        requestIdentity(suite)
+        unresolvedModels(suite)
+    }
+
+    private static func requestIdentity(_ suite: TestSuite) {
+        let log = Log()
+        log.start()
+        log.feed("assistant.message", ["apiCallId": "call-1", "messageId": "chunk-1", "phase": "commentary"], at: -120)
+        log.feed("assistant.message", ["apiCallId": "call-1", "messageId": "chunk-2", "phase": "response"], at: -60)
+        log.feed("assistant.message", ["apiCallId": "call-1", "messageId": "chunk-2", "phase": "response"], at: -60)
+        suite.expect(log.requests == 1 && log.store.records.first?.date == log.now.addingTimeInterval(-120),
+                     "several Copilot message chunks and replays represent one API call at its original date")
+        suite.expect(log.feed("assistant.turn_end", ["turnId": "0"]).count == 1 && !log.state.turnOpen,
+                     "deduplicating Copilot request activity still processes the final chunk's lifecycle")
+        log.feed("session.shutdown", ["modelMetrics": ["gpt-6-sol": ["requests": ["count": 1],
+                                                                   "usage": ["inputTokens": 10]]]])
+        suite.expect(log.requests == 1, "shutdown does not inflate a multi-chunk Copilot API call")
+        log.feed("assistant.message", ["apiCallId": "call-2", "messageId": "chunk-3"])
+        suite.expect(log.requests == 2, "different Copilot API call IDs count separately")
+        log.feed("assistant.message", ["apiCallId": "call-2", "messageId": "chunk-4"], agent: "helper")
+        suite.expect(log.requests == 3, "request identities are scoped to the emitting Copilot agent")
+        log.feed("assistant.message", ["apiCallId": "", "messageId": "legacy-1"])
+        log.feed("assistant.message", ["messageId": "legacy-1"])
+        log.feed("assistant.message", ["messageId": "legacy-2"])
+        log.feed("assistant.message", ["messageId": "call-1"])
+        suite.expect(log.requests == 6,
+                     "missing or empty Copilot API IDs retain message fallback without colliding with call IDs")
+    }
+
+    private static func unresolvedModels(_ suite: TestSuite) {
+        let log = Log()
+        log.start()
+        log.feed("assistant.message", ["apiCallId": "root-call", "messageId": "root"])
+        log.feed("assistant.message", ["apiCallId": "helper-call", "messageId": "helper-1"], agent: "helper", at: -86_400)
+        log.feed("assistant.message", ["apiCallId": "helper-call", "messageId": "helper-2"], agent: "helper", at: -86_399)
+        suite.expect(log.requests == 2 && log.store.records.filter { $0.model.isEmpty }.count == 1
+                        && log.state.copilotRequests["gpt-6-sol"] == 1,
+                     "model-less Copilot subagent chunks stay separate from the root model's request count")
+        let metrics: [String: Any] = [
+            "gpt-6-sol": ["requests": ["count": 1], "usage": ["inputTokens": 10]],
+            "claude-sonnet-4.5": ["requests": ["count": 1], "usage": ["inputTokens": 20]]
+        ]
+        log.feed("session.shutdown", ["modelMetrics": metrics])
+        suite.expect(log.requests == 2 && log.store.records.reduce(0) { $0 + $1.tokens.input } == 30,
+                     "shutdown counts an unresolved Copilot subagent once while retaining actual model token totals")
+        let recordCount = log.store.records.count
+        log.feed("session.shutdown", ["modelMetrics": metrics])
+        suite.expect(log.requests == 2 && log.store.records.count == recordCount,
+                     "repeated Copilot shutdowns never spend the same unresolved-request credit twice")
+        let before = log.store.snapshot(plans: [:], providers: [.copilot], now: log.now)
+        log.feed("assistant.message", ["apiCallId": "helper-call", "messageId": "helper-3", "model": "claude-sonnet-4.5"],
+                 agent: "helper")
+        let after = log.store.snapshot(plans: [:], providers: [.copilot], now: log.now)
+        let fresh = AgentUsageSummary.snapshot(records: log.store.records, limits: [:], live: [], plans: [:],
+                                               providers: [.copilot], now: log.now)
+        suite.expect(log.requests == 2 && log.store.records.filter { $0.model.isEmpty }.isEmpty
+                        && log.store.records.first(where: { $0.model == "claude-sonnet-4.5" })?.date
+                            == log.now.addingTimeInterval(-86_400),
+                     "a later Copilot chunk can resolve its request's model without changing its count or original day")
+        suite.expect(before.days.map { $0.total.requests } == after.days.map { $0.total.requests }
+                        && after.periods == fresh.periods,
+                     "late Copilot model attribution updates cached model shares without shifting historical activity")
+        log.feed("session.shutdown", ["modelMetrics": metrics])
+        suite.expect(log.requests == 2, "shutdown after late model attribution does not duplicate a request")
+        log.feed("assistant.message", ["apiCallId": "new-helper-call", "messageId": "new-helper"], agent: "helper")
+        var resumed = metrics
+        resumed["claude-sonnet-4.5"] = ["requests": ["count": 2], "usage": ["inputTokens": 25]]
+        log.feed("session.shutdown", ["modelMetrics": resumed])
+        suite.expect(log.requests == 3 && log.store.records.reduce(0) { $0 + $1.tokens.input } == 35,
+                     "resumed Copilot sessions reconcile new unresolved requests and cumulative token growth")
+
+        let ambiguous = Log()
+        ambiguous.feed("assistant.message", ["apiCallId": "unknown", "messageId": "unknown-1"], agent: "helper")
+        let totals: [String: Any] = ["gpt-6-sol": ["requests": ["count": 2]],
+                                     "claude-sonnet-4.5": ["requests": ["count": 2]]]
+        ambiguous.feed("session.shutdown", ["modelMetrics": totals])
+        suite.expect(ambiguous.requests == 4 && ambiguous.state.copilotRequests[""] == 2
+                        && ambiguous.state.copilotRequests["gpt-6-sol"] == 1
+                        && ambiguous.state.copilotRequests["claude-sonnet-4.5"] == 1,
+                     "an unresolved request offsets the whole shutdown once, without guessing its model")
+        ambiguous.feed("session.shutdown", ["modelMetrics": totals])
+        suite.expect(ambiguous.requests == 4, "ambiguous multi-model shutdown reconciliation is idempotent")
+        ambiguous.feed("assistant.message", ["apiCallId": "unknown", "messageId": "unknown-2", "model": "gpt-6-sol"],
+                       agent: "helper")
+        ambiguous.feed("session.shutdown", ["modelMetrics": totals])
+        suite.expect(ambiguous.requests == 4, "resolving one ambiguous request cannot cause another shutdown top-up")
     }
 
     private static func turns(_ suite: TestSuite) {
