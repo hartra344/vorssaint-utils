@@ -319,8 +319,8 @@ final class AgentUsageService: ObservableObject {
                 if read(file.path, provider: file.provider) { changed = true }
             }
         } else {
-            for path in Set(paths) where AgentLogReader.isLog(path) {
-                guard let root = watchedRoots.first(where: { path.hasPrefix($0.url.path + "/") }) else { continue }
+            for path in Set(paths) {
+                guard let root = watchedRoots.first(where: { $0.accepts(path) }) else { continue }
                 if read(path, provider: root.provider) { changed = true }
             }
         }

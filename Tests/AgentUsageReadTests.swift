@@ -10,6 +10,9 @@ typealias AgentUsageProductionLogReader = AgentLogReader
 enum AgentUsageReadTests {
     enum AgentLogReader {
         static var beforeLine: (() -> Void)?
+        static func discover(_ roots: [AgentLogRoot], since horizon: Date) -> [(path: String, provider: AgentProvider)] {
+            AgentUsageProductionLogReader.discover(roots, since: horizon)
+        }
         static func copilotHistoryLine(_ buffer: Data, range: Range<Int>) -> Bool {
             AgentUsageProductionLogReader.copilotHistoryLine(buffer, range: range)
         }
@@ -36,11 +39,16 @@ enum AgentUsageReadTests {
     }
 
     class Fixture {
+        static let horizon: TimeInterval = 91 * 86_400
+        var readerSession = 1
+        var watchedRoots: [AgentLogRoot] = []
         var readerCancellation: Cancellation? = Cancellation()
         var cursors: [String: AgentLogCursor] = [:]
         let store = AgentUsageStore()
         var events: [AgentUsageEvent] = []
         func report(_ event: AgentUsageEvent) { events.append(event) }
+        func checkLimits() {}
+        func schedulePublish() {}
     }
 
     static func run(_ suite: TestSuite) {
@@ -129,8 +137,11 @@ enum AgentUsageReadTests {
         let openLines = [
             #"{"id":"start","timestamp":"2026-09-27T15:00:00.000Z","type":"session.start","data":{"sessionId":"open","selectedModel":"gpt-6-sol","context":{"cwd":"/tmp/open-project"}}}"#,
             #"{"id":"turn","timestamp":"2026-09-27T15:01:00.000Z","type":"user.message","data":{"content":"still working"}}"#,
-            #"{"id":"reply","timestamp":"2026-09-27T15:01:30.000Z","type":"assistant.message","data":{"model":"gpt-6-sol","content":"in progress"}}"#,
-            #"{"id":"checkpoint","timestamp":"2026-09-27T15:01:45.000Z","type":"session.usage_checkpoint","data":{"totalPremiumRequests":0}}"#
+            #"{"id":"iteration","timestamp":"2026-09-27T15:01:01.000Z","type":"assistant.turn_start","data":{"turnId":"0"}}"#,
+            #"{"id":"reply","timestamp":"2026-09-27T15:01:30.000Z","type":"assistant.message","data":{"model":"gpt-6-sol","content":"in progress","toolRequests":[{"name":"read_file","toolCallId":"tool"}]}}"#,
+            #"{"id":"checkpoint","timestamp":"2026-09-27T15:01:45.000Z","type":"session.usage_checkpoint","data":{"totalPremiumRequests":0}}"#,
+            #"{"id":"intermediate-end","timestamp":"2026-09-27T15:01:46.000Z","type":"assistant.turn_end","data":{"turnId":"0"}}"#,
+            #"{"id":"next-iteration","timestamp":"2026-09-27T15:01:47.000Z","type":"assistant.turn_start","data":{"turnId":"1"}}"#
         ]
         try? Data((openLines.joined(separator: "\n") + "\n").utf8).write(to: openFile)
         let openHost = Host()
@@ -139,10 +150,14 @@ enum AgentUsageReadTests {
                         && openHost.store.turns[openFile.path]?.model == "gpt-6-sol"
                         && openHost.cursors[openFile.path]?.state.turnOpen == true
                         && openHost.store.records.count == 1,
-                     "startup restores a Copilot turn that remains open after an intermediate checkpoint")
+                     "startup restores ongoing Copilot work after a checkpoint and an intermediate tool turn-end")
         if let handle = try? FileHandle(forWritingTo: openFile) {
             _ = try? handle.seekToEnd()
-            try? handle.write(contentsOf: Data((#"{"id":"end","timestamp":"2026-09-27T15:02:00.000Z","type":"assistant.turn_end","data":{"turnId":"0"}}"# + "\n").utf8))
+            let end = [
+                #"{"id":"final","timestamp":"2026-09-27T15:01:59.000Z","type":"assistant.message","data":{"content":"done"}}"#,
+                #"{"id":"end","timestamp":"2026-09-27T15:02:00.000Z","type":"assistant.turn_end","data":{"turnId":"1"}}"#
+            ]
+            try? handle.write(contentsOf: Data((end.joined(separator: "\n") + "\n").utf8))
             try? handle.close()
         }
         openHost.store.reportsTransitions = true
@@ -150,5 +165,24 @@ enum AgentUsageReadTests {
                         && openHost.cursors[openFile.path]?.state.turnOpen == false
                         && openHost.store.turns[openFile.path] == nil,
                      "the restored Copilot turn finishes when its root assistant turn-end arrives")
+
+        // Exercise the production watcher callback, not only discovery.
+        let root = folder.appending(path: "session-state")
+        let session = root.appending(path: "demo")
+        let workspace = session.appending(path: "workspace/nested")
+        try? FileManager.default.createDirectory(at: workspace, withIntermediateDirectories: true)
+        let real = session.appending(path: "events.jsonl")
+        let nested = workspace.appending(path: "events.jsonl")
+        let arbitrary = session.appending(path: "data.jsonl")
+        let bytes = Data((openLines.joined(separator: "\n") + "\n").utf8)
+        for file in [real, nested, arbitrary] { try? bytes.write(to: file) }
+        let watcher = Host()
+        watcher.watchedRoots = [AgentLogRoot(provider: .copilot, url: root)]
+        watcher.filesChanged([nested.path, arbitrary.path, real.path], rescan: false)
+        suite.expect(Set(watcher.cursors.keys) == [real.path] && watcher.store.records.count == 1,
+                     "Copilot file watching admits only each session's event log and never its workspace JSONL")
+        watcher.filesChanged([], rescan: true)
+        suite.expect(Set(watcher.cursors.keys) == [real.path] && watcher.store.records.count == 1,
+                     "Copilot rescans use the same path boundary and do not duplicate live activity")
     }
 }

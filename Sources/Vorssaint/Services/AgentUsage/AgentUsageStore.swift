@@ -50,7 +50,10 @@ final class AgentUsageStore {
         for entry in entries {
             switch entry {
             case .usage(let key, let record, let billable):
-                add(record, billable: billable, key: key, turn: tracksTurns ? file : parent, subagent: !tracksTurns)
+                // Copilot exposes response activity and session-wide token
+                // totals, neither of which measures the current root task.
+                let turn = provider == .copilot ? nil : tracksTurns ? file : parent
+                add(record, billable: billable, key: key, turn: turn, subagent: !tracksTurns)
             case .limits(let reading):
                 if (limits[reading.provider]?.observedAt ?? .distantPast) <= reading.observedAt {
                     limits[reading.provider] = reading
@@ -132,6 +135,7 @@ final class AgentUsageStore {
             combined.webSearches = max(combined.webSearches, billable.webSearches)
             combined.fast = combined.fast || billable.fast
             combined.domestic = combined.domestic || billable.domestic
+            combined.isAggregate = combined.isAggregate || billable.isAggregate
             let priced = AgentPricing.cost(combined, model: old.model)
             delta = AgentTokens(input: merged.input - old.tokens.input,
                                 cacheWrite: merged.cacheWrite - old.tokens.cacheWrite,
@@ -237,6 +241,15 @@ struct AgentLogRoot: Equatable {
         var directory: ObjCBool = false
         return FileManager.default.fileExists(atPath: url.path, isDirectory: &directory) && directory.boolValue
     }
+
+    /// Discovery and live file events must admit exactly the same logs.
+    func accepts(_ path: String) -> Bool {
+        let prefix = url.path + "/"
+        guard path.hasPrefix(prefix), AgentLogReader.isLog(path) else { return false }
+        guard provider == .copilot else { return true }
+        let parts = path.dropFirst(prefix.count).split(separator: "/", omittingEmptySubsequences: false)
+        return parts.count == 2 && !parts[0].isEmpty && !parts[0].hasPrefix(".") && parts[1] == "events.jsonl"
+    }
 }
 
 /// How far into one log file reading has got.
@@ -276,11 +289,6 @@ enum AgentLogReader {
     /// A line longer than this is a pasted file or a tool's output, never a
     /// usage record; it is skipped rather than held in memory.
     static let maximumLine = 32 << 20
-    private static let copilotHistoryMarkers = [
-        Data(#""type":"session."#.utf8), Data(#""type":"user.message""#.utf8),
-        Data(#""type":"assistant.message""#.utf8), Data(#""type":"assistant.turn_end""#.utf8),
-        Data(#""type":"abort""#.utf8)
-    ]
 
     static func isLog(_ path: String) -> Bool { path.hasSuffix(".jsonl") }
 
@@ -291,7 +299,8 @@ enum AgentLogReader {
         var found: [(path: String, provider: AgentProvider, modified: Date, subagent: Bool)] = []
         let keys: [URLResourceKey] = [.contentModificationDateKey, .isRegularFileKey]
         func include(_ url: URL, from root: AgentLogRoot) {
-            guard let values = try? url.resourceValues(forKeys: Set(keys)), values.isRegularFile == true,
+            guard root.accepts(url.path),
+                  let values = try? url.resourceValues(forKeys: Set(keys)), values.isRegularFile == true,
                   let modified = values.contentModificationDate, modified >= horizon else { return }
             let subagent = root.provider == .claude && AgentLogCursor.parent(of: url.path) != nil
             found.append((url.path, root.provider, modified, subagent))
@@ -353,14 +362,14 @@ enum AgentLogReader {
         }
     }
 
-    /// The first Copilot pass needs session metadata and counters, not the
-    /// potentially enormous prompt, reply and tool payloads between them.
-    /// The exact unescaped structural key cannot match quoted message text.
+    /// Skip unrelated payloads before copying a line. Only top-level event
+    /// types count, including in whitespace-formatted logs or nested results.
     static func copilotHistoryLine(_ buffer: Data, range: Range<Int>) -> Bool {
-        copilotHistoryMarkers.contains { buffer.range(of: $0, options: [], in: range) != nil }
+        guard let type = AgentLogObject(buffer, range: range)?.string("type") else { return false }
+        return AgentLogParser.copilotEvent(type)
     }
 
-    /// Streams every structural event so checkpoints keep their original date
+    /// Streams every structural event so responses keep their original date
     /// and model, and the final turn state is restored. The line filter keeps
     /// unrelated workspace output from being copied or decoded.
     static func readCopilotHistory(_ cursor: AgentLogCursor, shouldContinue: () -> Bool = { true },

@@ -35,6 +35,10 @@ struct AgentLogState: Equatable {
     var fast = false
     /// Copilot shutdown counters are cumulative for the life of a session.
     var copilotTotals: [String: AgentTokens] = [:]
+    var copilotRequests: [String: Int] = [:]
+    var copilotMessages: Set<String> = []
+    var copilotTurnID: String?
+    var copilotFinalResponse = false
 }
 
 enum AgentLogParser {
@@ -51,27 +55,6 @@ enum AgentLogParser {
 
     private static func object(_ line: Data) -> [String: Any]? {
         (try? JSONSerialization.jsonObject(with: line)) as? [String: Any]
-    }
-
-    /// Reads one simple unescaped JSON string without decoding a line's large
-    /// content payload. Agent timestamps, model names and IDs use this form.
-    private static func string(_ line: Data, after needle: StaticString) -> String? {
-        let key = Data(bytes: needle.utf8Start, count: needle.utf8CodeUnitCount)
-        guard let match = line.range(of: key),
-              let end = line[match.upperBound...].firstIndex(of: 0x22) else { return nil }
-        let bytes = line[match.upperBound..<end]
-        guard !bytes.contains(0x5C) else { return nil }
-        return String(decoding: bytes, as: UTF8.self)
-    }
-
-    private static func copilotTimestamp(_ line: Data, now: Date) -> Date {
-        if let text = string(line, after: #""timestamp":""#), let date = AgentTimestamp.parse(text) { return date }
-        let key = Data(#""timestamp":"#.utf8)
-        guard let match = line.range(of: key) else { return now }
-        let tail = line[match.upperBound...]
-        let end = tail.firstIndex(where: { $0 == 0x2C || $0 == 0x7D }) ?? tail.endIndex
-        guard let raw = Double(String(decoding: tail[..<end], as: UTF8.self)), raw.isFinite, raw > 0 else { return now }
-        return Date(timeIntervalSince1970: raw > 100_000_000_000 ? raw / 1000 : raw)
     }
 
     // MARK: Claude Code
@@ -295,68 +278,77 @@ enum AgentLogParser {
     /// Only session context, turn boundaries and cumulative model counters are
     /// decoded; prompts, replies, reasoning and tool arguments are ignored.
     static func parseCopilot(_ line: Data, state: inout AgentLogState, now: Date) -> [AgentLogEntry] {
-        // Messages hold nearly all of a Copilot log's bytes. Their structural
-        // envelope is enough to restore live work; never JSON-decode content.
-        if contains(line, #""type":"user.message""#) {
-            guard copilotRoot(line) else { return [] }
-            let date = copilotTimestamp(line, now: now)
-            if state.turnOpen { return [.turnActive(date)] }
-            state.turnOpen = true
-            return [.turnBegan(date), .turnContext(model: state.model, project: state.project)]
-        }
-        if contains(line, #""type":"assistant.message""#) {
-            guard copilotRoot(line) else { return [] }
-            let date = copilotTimestamp(line, now: now)
-            if let model = string(line, after: #""model":""#), !model.isEmpty { state.model = native(model) }
-            return state.turnOpen ? [.turnContext(model: state.model, project: state.project), .turnActive(date)] : []
-        }
-        if contains(line, #""type":"assistant.turn_end""#) {
-            guard copilotRoot(line), state.turnOpen else { return [] }
-            state.turnOpen = false
-            return [.turnEnded(copilotTimestamp(line, now: now), completed: true, duration: nil)]
-        }
-        if contains(line, #""type":"session.usage_checkpoint""#) {
-            guard copilotRoot(line) else { return [] }
-            let date = copilotTimestamp(line, now: now)
-            let checkpoint = string(line, after: #""id":""#).flatMap { $0.isEmpty ? nil : native($0) }
-                ?? String(date.timeIntervalSince1970)
-            let activity = AgentUsageRecord(provider: .copilot, date: date, model: state.model,
-                                            project: state.project, session: state.session,
-                                            tokens: AgentTokens(), cost: 0, savings: 0)
-            return [.usage(
-                key: "copilot:\(state.session):\(checkpoint):activity", record: activity,
-                billable: AgentBillable())]
-        }
-        let relevant = contains(line, #""type":"session.start""#)
-            || contains(line, #""type":"session.model_change""#)
-            || contains(line, #""type":"session.shutdown""#)
-            || contains(line, #""type":"abort""#)
-        guard relevant, let json = object(line), let type = json["type"] as? String else { return [] }
-        let data = json["data"] as? [String: Any] ?? [:]
-        let date = timestamp(json["timestamp"]) ?? now
-
+        guard let envelope = AgentLogObject(line), let type = envelope.string("type"),
+              copilotEvent(type), let data = envelope.object("data") else { return [] }
+        let root = envelope.string("agentId")?.isEmpty != false
+        // Subagents share the root log. Their responses count as activity,
+        // but their lifecycle and model changes never change the root task.
+        guard root || type == "assistant.message" else { return [] }
+        let date = timestamp(envelope.value("timestamp")) ?? now
         switch type {
+        case "user.message", "assistant.turn_start":
+            state.copilotFinalResponse = false
+            state.copilotTurnID = type == "assistant.turn_start" ? data.string("turnId") : nil
+            if let model = data.string("model"), !model.isEmpty { state.model = native(model) }
+            let entry: AgentLogEntry = state.turnOpen ? .turnActive(date) : .turnBegan(date)
+            state.turnOpen = true
+            return [entry, .turnContext(model: state.model, project: state.project)]
+        case "assistant.message":
+            let model = data.string("model").flatMap { $0.isEmpty ? nil : native($0) } ?? state.model
+            let message = data.string("messageId") ?? envelope.string("id") ?? String(date.timeIntervalSince1970)
+            var entries: [AgentLogEntry] = []
+            if state.copilotMessages.insert(message).inserted {
+                state.copilotRequests[model, default: 0] += 1
+                let activity = AgentUsageRecord(provider: .copilot, date: date, model: model,
+                                                project: state.project, session: state.session,
+                                                tokens: AgentTokens(), cost: 0, savings: 0)
+                entries.append(.usage(key: "copilot:\(state.session):\(message):activity",
+                                      record: activity, billable: AgentBillable(isAggregate: true)))
+            }
+            guard root else { return entries }
+            state.model = model
+            // Each tool iteration has its own turn_end. Only an iteration
+            // delivering a final response can finish the person's task.
+            state.copilotFinalResponse = !data.hasItems("toolRequests")
+                && !["thinking", "commentary"].contains(data.string("phase") ?? "")
+            if state.turnOpen {
+                entries += [.turnContext(model: state.model, project: state.project), .turnActive(date)]
+            }
+            return entries
+        case "assistant.turn_end":
+            guard state.turnOpen,
+                  state.copilotTurnID == nil || state.copilotTurnID == data.string("turnId") else { return [] }
+            guard state.copilotFinalResponse else { return [.turnActive(date)] }
+            state.turnOpen = false
+            state.copilotFinalResponse = false
+            return [.turnEnded(date, completed: true, duration: nil)]
         case "session.start":
-            if let session = data["sessionId"] as? String, !session.isEmpty {
+            if let session = data.string("sessionId"), !session.isEmpty {
                 state.session = native(session)
             }
-            if let model = data["selectedModel"] as? String, !model.isEmpty {
+            if let model = data.string("selectedModel"), !model.isEmpty {
                 state.model = native(model)
             }
-            if let context = data["context"] as? [String: Any],
-               let path = ["gitRoot", "cwd", "repository"].compactMap({ context[$0] as? String }).first(where: { !$0.isEmpty }) {
+            if let context = data.object("context"),
+               let path = ["gitRoot", "cwd", "repository"].compactMap({ context.string($0) }).first(where: { !$0.isEmpty }) {
                 state.project = projectName(path)
             }
             return []
+        case "session.context_changed":
+            if let path = ["gitRoot", "cwd", "repository"].compactMap({ data.string($0) }).first(where: { !$0.isEmpty }) {
+                state.project = projectName(path)
+            }
+            return state.turnOpen ? [.turnContext(model: state.model, project: state.project)] : []
         case "session.model_change":
-            if let model = data["newModel"] as? String, !model.isEmpty { state.model = native(model) }
-            return []
+            if let model = data.string("newModel"), !model.isEmpty { state.model = native(model) }
+            return state.turnOpen ? [.turnContext(model: state.model, project: state.project)] : []
         case "abort":
             guard state.turnOpen else { return [] }
             state.turnOpen = false
+            state.copilotFinalResponse = false
             return [.turnEnded(date, completed: false, duration: nil)]
         case "session.shutdown":
-            var entries = copilotUsage(data["modelMetrics"] as? [String: Any], event: json["id"] as? String,
+            var entries = copilotUsage(data.value("modelMetrics") as? [String: Any], event: envelope.string("id"),
                                        date: date, state: &state)
             if state.turnOpen {
                 state.turnOpen = false
@@ -368,14 +360,9 @@ enum AgentLogParser {
         }
     }
 
-    /// Root events omit agentId; subagent events in the same file carry one.
-    private static func copilotRoot(_ json: [String: Any]) -> Bool {
-        (json["agentId"] as? String)?.isEmpty != false
-    }
-
-    private static func copilotRoot(_ line: Data) -> Bool {
-        guard contains(line, #""agentId":""#) else { return true }
-        return string(line, after: #""agentId":""#)?.isEmpty == true
+    static func copilotEvent(_ type: String) -> Bool {
+        ["user.message", "assistant.turn_start", "assistant.message", "assistant.turn_end",
+         "session.start", "session.context_changed", "session.model_change", "session.shutdown", "abort"].contains(type)
     }
 
     private static func copilotUsage(_ metrics: [String: Any]?, event: String?, date: Date,
@@ -388,15 +375,21 @@ enum AgentLogParser {
             let previous = state.copilotTotals[model]
             let tokens = tokenGrowth(total, after: previous)
             state.copilotTotals[model] = total
-            guard tokens.total > 0 else { continue }
-            let billable = AgentBillable(tokens: tokens)
+            let recorded = state.copilotRequests[model, default: 0]
+            let reported = int((metric["requests"] as? [String: Any])?["count"])
+            // Responses retain their own dates. A partial or older log can
+            // still prove activity at shutdown even without those responses.
+            let requests = max(0, max(reported, tokens.total > 0 ? 1 : 0) - recorded)
+            state.copilotRequests[model] = recorded + requests
+            guard tokens.total > 0 || requests > 0 else { continue }
+            let billable = AgentBillable(tokens: tokens, isAggregate: true)
             let name = native(model)
             let priced = AgentPricing.cost(billable, model: name)
             let checkpoint = event.flatMap { $0.isEmpty ? nil : native($0) }
                 ?? String(date.timeIntervalSince1970)
             entries.append(.usage(key: "copilot:\(state.session):\(checkpoint):\(name)", record: AgentUsageRecord(
                 provider: .copilot, date: date, model: name, project: state.project, session: state.session,
-                requests: 0, tokens: tokens, cost: priced.cost, savings: priced.savings), billable: billable))
+                requests: requests, tokens: tokens, cost: priced.cost, savings: priced.savings), billable: billable))
         }
         return entries
     }
