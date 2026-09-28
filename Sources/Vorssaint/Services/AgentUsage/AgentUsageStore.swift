@@ -276,7 +276,10 @@ enum AgentLogReader {
     /// A line longer than this is a pasted file or a tool's output, never a
     /// usage record; it is skipped rather than held in memory.
     static let maximumLine = 32 << 20
-    private static let copilotHistoryMarker = Data(#""type":"session."#.utf8)
+    private static let copilotHistoryMarkers = [
+        Data(#""type":"session."#.utf8), Data(#""type":"user.message""#.utf8),
+        Data(#""type":"assistant.message""#.utf8), Data(#""type":"abort""#.utf8)
+    ]
 
     static func isLog(_ path: String) -> Bool { path.hasSuffix(".jsonl") }
 
@@ -353,94 +356,15 @@ enum AgentLogReader {
     /// potentially enormous prompt, reply and tool payloads between them.
     /// The exact unescaped structural key cannot match quoted message text.
     static func copilotHistoryLine(_ buffer: Data, range: Range<Int>) -> Bool {
-        buffer.range(of: copilotHistoryMarker, options: [], in: range) != nil
+        copilotHistoryMarkers.contains { buffer.range(of: $0, options: [], in: range) != nil }
     }
 
-    /// Restores a Copilot session from its small opening metadata and final
-    /// cumulative checkpoints. Session logs embed whole conversations and
-    /// workspace tool output between those edges; rereading that private,
-    /// irrelevant payload on every launch makes startup proportional to the
-    /// archive's size instead of the number of sessions.
+    /// Streams every structural event so checkpoints keep their original date
+    /// and model, and the final turn state is restored. The line filter keeps
+    /// unrelated workspace output from being copied or decoded.
     static func readCopilotHistory(_ cursor: AgentLogCursor, shouldContinue: () -> Bool = { true },
                                    line: (Data) -> Void) {
-        guard shouldContinue() else { return }
-        var info = stat()
-        guard stat(cursor.path, &info) == 0, (info.st_mode & S_IFMT) == S_IFREG else { return }
-        let size = UInt64(max(0, info.st_size))
-        let identity = UInt64(info.st_ino)
-        cursor.modified = Date(timeIntervalSince1970: TimeInterval(info.st_mtimespec.tv_sec)
-                                + TimeInterval(info.st_mtimespec.tv_nsec) / 1_000_000_000)
-        if identity != cursor.identity || size < cursor.offset { cursor.state = AgentLogState() }
-        cursor.identity = identity
-        cursor.offset = 0
-        cursor.pending = Data()
-        cursor.discarding = false
-        guard size > 0, let handle = FileHandle(forReadingAtPath: cursor.path) else { return }
-        defer { try? handle.close() }
-
-        // Small logs already fit in the ordinary streaming path, which also
-        // preserves a final line that is still being written.
-        let edge = UInt64(chunkSize)
-        if size <= edge * 2 {
-            readAppended(cursor, shouldContinue: shouldContinue, including: copilotHistoryLine, line: line)
-            return
-        }
-
-        guard let prefix = try? handle.read(upToCount: Int(edge)), !prefix.isEmpty,
-              shouldContinue() else { return }
-        emitCompleteLines(prefix, from: 0, including: copilotHistoryLine, line: line)
-
-        // Read one byte before the tail so a newline there proves that the
-        // following byte begins a complete line; otherwise discard the first
-        // tail fragment through its newline.
-        let readOffset = size - edge - 1
-        do { try handle.seek(toOffset: readOffset) } catch { return }
-        guard let tail = try? handle.read(upToCount: Int(edge) + 1), !tail.isEmpty,
-              shouldContinue() else { return }
-        let start: Int
-        if tail[tail.startIndex] == 0x0A {
-            start = 1
-        } else if let newline = tail.firstIndex(of: 0x0A) {
-            start = newline + 1
-        } else {
-            // The tail is one continued oversized line. Its eventual newline
-            // must be discarded when more bytes arrive.
-            cursor.offset = size
-            cursor.discarding = true
-            return
-        }
-        let trailing = emitCompleteLines(tail, from: start, including: copilotHistoryLine, line: line)
-        let remainder = tail.count - trailing
-        if remainder > maximumLine {
-            cursor.discarding = true
-        } else if remainder > 0 {
-            cursor.pending = tail.subdata(in: trailing..<tail.count)
-        }
-        cursor.offset = size
-    }
-
-    /// Emits newline-terminated ranges and returns the start of a trailing
-    /// incomplete line.
-    @discardableResult
-    private static func emitCompleteLines(_ buffer: Data, from initial: Int,
-                                          including: (Data, Range<Int>) -> Bool,
-                                          line: (Data) -> Void) -> Int {
-        var start = initial
-        let count = buffer.count
-        buffer.withUnsafeBytes { raw in
-            guard let base = raw.baseAddress else { return }
-            var position = initial
-            while position < count, let found = memchr(base + position, 0x0A, count - position) {
-                let end = base.distance(to: UnsafeRawPointer(found))
-                let range = start..<end
-                if !range.isEmpty, range.count <= maximumLine, including(buffer, range) {
-                    line(buffer.subdata(in: range))
-                }
-                start = end + 1
-                position = start
-            }
-        }
-        return start
+        readAppended(cursor, shouldContinue: shouldContinue, including: copilotHistoryLine, line: line)
     }
 
     private static func split(_ chunk: Data, cursor: AgentLogCursor,

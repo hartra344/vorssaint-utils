@@ -35,8 +35,6 @@ struct AgentLogState: Equatable {
     var fast = false
     /// Copilot shutdown counters are cumulative for the life of a session.
     var copilotTotals: [String: AgentTokens] = [:]
-    /// Copilot repeats its cumulative premium-request count at checkpoints.
-    var copilotPremiumRequests = 0
 }
 
 enum AgentLogParser {
@@ -53,6 +51,27 @@ enum AgentLogParser {
 
     private static func object(_ line: Data) -> [String: Any]? {
         (try? JSONSerialization.jsonObject(with: line)) as? [String: Any]
+    }
+
+    /// Reads one simple unescaped JSON string without decoding a line's large
+    /// content payload. Agent timestamps, model names and IDs use this form.
+    private static func string(_ line: Data, after needle: StaticString) -> String? {
+        let key = Data(bytes: needle.utf8Start, count: needle.utf8CodeUnitCount)
+        guard let match = line.range(of: key),
+              let end = line[match.upperBound...].firstIndex(of: 0x22) else { return nil }
+        let bytes = line[match.upperBound..<end]
+        guard !bytes.contains(0x5C) else { return nil }
+        return String(decoding: bytes, as: UTF8.self)
+    }
+
+    private static func copilotTimestamp(_ line: Data, now: Date) -> Date {
+        if let text = string(line, after: #""timestamp":""#), let date = AgentTimestamp.parse(text) { return date }
+        let key = Data(#""timestamp":"#.utf8)
+        guard let match = line.range(of: key) else { return now }
+        let tail = line[match.upperBound...]
+        let end = tail.firstIndex(where: { $0 == 0x2C || $0 == 0x7D }) ?? tail.endIndex
+        guard let raw = Double(String(decoding: tail[..<end], as: UTF8.self)), raw.isFinite, raw > 0 else { return now }
+        return Date(timeIntervalSince1970: raw > 100_000_000_000 ? raw / 1000 : raw)
     }
 
     // MARK: Claude Code
@@ -276,11 +295,39 @@ enum AgentLogParser {
     /// Only session context, turn boundaries and cumulative model counters are
     /// decoded; prompts, replies, reasoning and tool arguments are ignored.
     static func parseCopilot(_ line: Data, state: inout AgentLogState, now: Date) -> [AgentLogEntry] {
+        // Messages hold nearly all of a Copilot log's bytes. Their structural
+        // envelope is enough to restore live work; never JSON-decode content.
+        if contains(line, #""type":"user.message""#) {
+            guard copilotRoot(line) else { return [] }
+            let date = copilotTimestamp(line, now: now)
+            if state.turnOpen { return [.turnActive(date)] }
+            state.turnOpen = true
+            return [.turnBegan(date), .turnContext(model: state.model, project: state.project)]
+        }
+        if contains(line, #""type":"assistant.message""#) {
+            guard copilotRoot(line) else { return [] }
+            let date = copilotTimestamp(line, now: now)
+            if let model = string(line, after: #""model":""#), !model.isEmpty { state.model = native(model) }
+            return state.turnOpen ? [.turnContext(model: state.model, project: state.project), .turnActive(date)] : []
+        }
+        if contains(line, #""type":"session.usage_checkpoint""#) {
+            guard copilotRoot(line) else { return [] }
+            let date = copilotTimestamp(line, now: now)
+            let endedTurn = state.turnOpen
+            state.turnOpen = false
+            let checkpoint = string(line, after: #""id":""#).flatMap { $0.isEmpty ? nil : native($0) }
+                ?? String(date.timeIntervalSince1970)
+            let activity = AgentUsageRecord(provider: .copilot, date: date, model: state.model,
+                                            project: state.project, session: state.session,
+                                            tokens: AgentTokens(), cost: 0, savings: 0)
+            var entries: [AgentLogEntry] = [.usage(
+                key: "copilot:\(state.session):\(checkpoint):activity", record: activity,
+                billable: AgentBillable())]
+            if endedTurn { entries.append(.turnEnded(date, completed: true, duration: nil)) }
+            return entries
+        }
         let relevant = contains(line, #""type":"session.start""#)
             || contains(line, #""type":"session.model_change""#)
-            || contains(line, #""type":"user.message""#)
-            || contains(line, #""type":"assistant.message""#)
-            || contains(line, #""type":"session.usage_checkpoint""#)
             || contains(line, #""type":"session.task_complete""#)
             || contains(line, #""type":"session.shutdown""#)
             || contains(line, #""type":"abort""#)
@@ -304,39 +351,6 @@ enum AgentLogParser {
         case "session.model_change":
             if let model = data["newModel"] as? String, !model.isEmpty { state.model = native(model) }
             return []
-        case "user.message":
-            guard copilotRoot(json) else { return [] }
-            if state.turnOpen { return [.turnActive(date)] }
-            state.turnOpen = true
-            return [.turnBegan(date), .turnContext(model: state.model, project: state.project)]
-        case "assistant.message":
-            guard copilotRoot(json) else { return [] }
-            if let model = data["model"] as? String, !model.isEmpty { state.model = native(model) }
-            return state.turnOpen ? [.turnContext(model: state.model, project: state.project), .turnActive(date)] : []
-        case "session.usage_checkpoint":
-            guard copilotRoot(json) else { return [] }
-            let endedTurn = state.turnOpen
-            state.turnOpen = false
-            let requests: Int
-            if data["totalPremiumRequests"] != nil {
-                let total = int(data["totalPremiumRequests"])
-                requests = max(0, total - state.copilotPremiumRequests)
-                state.copilotPremiumRequests = max(state.copilotPremiumRequests, total)
-            } else {
-                requests = 1
-            }
-            let checkpoint = (json["id"] as? String).flatMap { $0.isEmpty ? nil : native($0) }
-                ?? String(date.timeIntervalSince1970)
-            var entries: [AgentLogEntry] = []
-            if requests > 0 {
-                let activity = AgentUsageRecord(provider: .copilot, date: date, model: state.model,
-                                                project: state.project, session: state.session, requests: requests,
-                                                tokens: AgentTokens(), cost: 0, savings: 0)
-                entries.append(.usage(key: "copilot:\(state.session):\(checkpoint):activity", record: activity,
-                                      billable: AgentBillable()))
-            }
-            if endedTurn { entries.append(.turnEnded(date, completed: true, duration: nil)) }
-            return entries
         case "session.task_complete":
             guard state.turnOpen else { return [] }
             state.turnOpen = false
@@ -361,6 +375,11 @@ enum AgentLogParser {
     /// Root events omit agentId; subagent events in the same file carry one.
     private static func copilotRoot(_ json: [String: Any]) -> Bool {
         (json["agentId"] as? String)?.isEmpty != false
+    }
+
+    private static func copilotRoot(_ line: Data) -> Bool {
+        guard contains(line, #""agentId":""#) else { return true }
+        return string(line, after: #""agentId":""#)?.isEmpty == true
     }
 
     private static func copilotUsage(_ metrics: [String: Any]?, event: String?, date: Date,
@@ -388,10 +407,16 @@ enum AgentLogParser {
 
     private static func copilotTokens(_ metric: [String: Any]) -> AgentTokens {
         let details = metric["tokenDetails"] as? [String: Any] ?? [:]
-        func count(_ key: String) -> Int { int((details[key] as? [String: Any])?["tokenCount"]) }
-        return AgentTokens(input: count("input"), cacheWrite: count("cache_write"), cacheRead: count("cache_read"),
-                           output: count("output"),
-                           reasoning: int((metric["usage"] as? [String: Any])?["reasoningTokens"]))
+        let usage = metric["usage"] as? [String: Any] ?? [:]
+        func count(_ detail: String, _ fallback: String) -> Int {
+            if let value = (details[detail] as? [String: Any])?["tokenCount"] { return int(value) }
+            return int(usage[fallback])
+        }
+        return AgentTokens(input: count("input", "inputTokens"),
+                           cacheWrite: count("cache_write", "cacheWriteTokens"),
+                           cacheRead: count("cache_read", "cacheReadTokens"),
+                           output: count("output", "outputTokens"),
+                           reasoning: int(usage["reasoningTokens"]))
     }
 
     private static func tokenGrowth(_ total: AgentTokens, after previous: AgentTokens?) -> AgentTokens {

@@ -123,5 +123,29 @@ enum AgentUsageReadTests {
             host.readerCancellation?.isCancelled = true
             suite.expect(!host.read(file.path, provider: provider), "a cancelled reading consumes no more entries")
         }
+
+        let openFile = folder.appending(path: "copilot-open.jsonl")
+        let openLines = [
+            #"{"id":"start","timestamp":"2026-09-27T15:00:00.000Z","type":"session.start","data":{"sessionId":"open","selectedModel":"gpt-6-sol","context":{"cwd":"/tmp/open-project"}}}"#,
+            #"{"id":"turn","timestamp":"2026-09-27T15:01:00.000Z","type":"user.message","data":{"content":"still working"}}"#,
+            #"{"id":"reply","timestamp":"2026-09-27T15:01:30.000Z","type":"assistant.message","data":{"model":"gpt-6-sol","content":"in progress"}}"#
+        ]
+        try? Data((openLines.joined(separator: "\n") + "\n").utf8).write(to: openFile)
+        let openHost = Host()
+        suite.expect(openHost.read(openFile.path, provider: .copilot)
+                        && openHost.store.turns[openFile.path]?.project == "open-project"
+                        && openHost.store.turns[openFile.path]?.model == "gpt-6-sol"
+                        && openHost.cursors[openFile.path]?.state.turnOpen == true,
+                     "an existing Copilot log restores the currently open turn on startup")
+        if let handle = try? FileHandle(forWritingTo: openFile) {
+            _ = try? handle.seekToEnd()
+            try? handle.write(contentsOf: Data((#"{"id":"end","timestamp":"2026-09-27T15:02:00.000Z","type":"session.usage_checkpoint","data":{"totalPremiumRequests":0}}"# + "\n").utf8))
+            try? handle.close()
+        }
+        openHost.store.reportsTransitions = true
+        suite.expect(openHost.read(openFile.path, provider: .copilot)
+                        && openHost.cursors[openFile.path]?.state.turnOpen == false
+                        && openHost.store.turns[openFile.path] == nil,
+                     "the restored Copilot turn finishes when its next checkpoint arrives")
     }
 }
