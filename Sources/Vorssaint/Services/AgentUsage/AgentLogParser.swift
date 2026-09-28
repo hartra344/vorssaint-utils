@@ -329,7 +329,6 @@ enum AgentLogParser {
         }
         let relevant = contains(line, #""type":"session.start""#)
             || contains(line, #""type":"session.model_change""#)
-            || contains(line, #""type":"session.task_complete""#)
             || contains(line, #""type":"session.shutdown""#)
             || contains(line, #""type":"abort""#)
         guard relevant, let json = object(line), let type = json["type"] as? String else { return [] }
@@ -352,10 +351,6 @@ enum AgentLogParser {
         case "session.model_change":
             if let model = data["newModel"] as? String, !model.isEmpty { state.model = native(model) }
             return []
-        case "session.task_complete":
-            guard state.turnOpen else { return [] }
-            state.turnOpen = false
-            return [.turnEnded(date, completed: data["success"] as? Bool != false, duration: nil)]
         case "abort":
             guard state.turnOpen else { return [] }
             state.turnOpen = false

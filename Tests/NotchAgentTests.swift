@@ -460,6 +460,9 @@ enum NotchAgentTests {
         suite.expect(checkpointEvents.isEmpty && state.turnOpen && state.session == "cp1"
                         && state.project == "app" && state.model == "gpt-6-sol",
                      "Copilot usage checkpoints record activity without closing the root turn")
+        suite.expect(feed(#"{"id":"task","timestamp":"2026-09-27T15:02:30.000Z","type":"session.task_complete","data":{"success":true}}"#).isEmpty
+                        && state.turnOpen,
+                     "Copilot session task completion waits for the root assistant turn-end boundary")
         let requestsBefore = store.records.reduce(0, { $0 + $1.requests })
         let repeated = feed(#"{"id":"repeat","timestamp":"2026-09-27T15:03:01.000Z","type":"session.usage_checkpoint","data":{"totalPremiumRequests":1}}"#)
         suite.expect(repeated.isEmpty && state.turnOpen
