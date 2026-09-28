@@ -278,6 +278,17 @@ def main():
                                    "    private func handle(type:",
                                    "    func commit("])
           + "}\n")
+    # The raw wheel tap runs as shipped: linear scrolling's cap, carry and
+    # write-back, then the direction change. Only the services it asks and
+    # the defaults it reads are fixtures.
+    wheel_tap = declaration("Sources/Vorssaint/Services/ScrollInverter.swift", "    private func handle(type:",
+                            scope="final class ScrollInverter:")
+    if wheel_tap.count("AppFeature.linearScroll.isAvailable") != 1:
+        raise ValueError("Expected one linear scrolling availability read in ScrollInverter.handle")
+    write("LinearScrollTap.swift", "import CoreGraphics\nimport Foundation\nextension LinearScrollTapTests.Inverter {\n"
+          + wheel_tap.replace("private func", "func", 1)
+                     .replace("AppFeature.linearScroll.isAvailable", "AppFeature.linearScroll.isAvailable(in: defaults)")
+          + "}\n")
     write("KeyboardDebounceTap.swift", "import ApplicationServices\nimport CoreGraphics\nimport Foundation\n"
           + "extension KeyboardDebounceTapTests.Service {\n"
           + declaration("Sources/Vorssaint/Services/KeyboardDebounce/KeyboardDebounceService.swift",
@@ -998,6 +1009,9 @@ def main():
     keep_awake = "Sources/Vorssaint/Services/KeepAwakeManager.swift"
     keep_awake_methods = [
         "    func refreshPasswordlessStatus(",
+        "    func activate(minutes:",
+        "    func activate(until date:",
+        "    func startLastPick(",
         "    func resumeAfterSystemTeardown(",
         "    private func activate(end:",
         "    func deactivate(reason:",
@@ -1032,7 +1046,8 @@ def main():
           + "var clamshellSetupInProgress = false\nvar clamshellSetupFailed = false\n"
           + "var clamshellSetupRetried = false\nvar passwordlessClamshell = true\n"
           + "var recoveryCompleted = false\nvar screenLocked = false\nvar assertionsHeld = false\n"
-          + "var endTimer: Timer?\nvar endDate: Date?\nvar sessionTrigger: SessionTrigger?\n"
+          + "var automationSuppressedUntilConditionsClear = false\n"
+          + "var endTimer: Timer?\nvar endDate: Date?\nvar sessionTrigger: SessionTrigger?\nvar sessionMinutes: Int?\n"
           + "var activeAutomationConditions = Set<KeepAwakeAutomationCondition>()\n"
           + "var onSessionEnded: ((EndReason) -> Void)?\n"
           + "var lidDimmingNotificationPort: IONotificationPortRef?\nvar lidDimmingNotification: io_object_t = 0\n"

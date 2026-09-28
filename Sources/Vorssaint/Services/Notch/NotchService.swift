@@ -85,6 +85,10 @@ final class NotchService: ObservableObject {
     /// Bumped when Command-W asks the Scratchpad page to close its selected
     /// pad, so the confirmation stays in the page as it does in the floating pad.
     @Published private(set) var scratchpadCloseSerial = 0
+    /// Find runs against the island's own text view, which the page holds;
+    /// the key arrives here, so it is passed on the way Command-W already is.
+    @Published private(set) var scratchpadFindSerial = 0
+    private(set) var scratchpadFindAction = NSTextFinder.Action.showFindInterface
     /// The last ⌘1–⌘9 pressed on the Clipboard page, which the page turns
     /// into a paste of the entry at that place.
     @Published private(set) var clipboardPastePress: NotchClipboardPastePress?
@@ -797,7 +801,7 @@ final class NotchService: ObservableObject {
         let showedPicker = showsCompactActivityPicker
         inside = hiddenUntilHover ? geometry.contains(point, in: geometry.collapsed)
             && windowHost?.isConcealedForMissionControl == false
-            : windowHost?.containsHover(point) == true
+            : windowHost?.containsHover(point) == true || pointerOverChildWindow(point)
         hoverState.update(pointerInside: inside)
         let emphasize = inside && !hiddenInFullscreen && !hiddenUntilHover && !expanded && !peeking && !dragPlaceholder
             && notice == nil && captureControls == nil
@@ -856,7 +860,8 @@ final class NotchService: ObservableObject {
                 guard let self else { return }
                 self.hoverWork = nil
                 guard self.running, !self.suspended, !self.inside,
-                      self.windowHost?.containsHover(NSEvent.mouseLocation) != true else { return }
+                      self.windowHost?.containsHover(NSEvent.mouseLocation) != true,
+                      !self.pointerOverChildWindow(NSEvent.mouseLocation) else { return }
                 self.releaseNotification()
                 guard !self.pinned, !self.heldDrag, !self.keepsWorkingSurface, self.captureControls == nil,
                       !AssistiveKeyboard.ownsCocoaPoint(NSEvent.mouseLocation),
@@ -1016,20 +1021,32 @@ final class NotchService: ObservableObject {
     private func handleScratchpadKey(_ event: NSEvent) -> Bool {
         guard selected == .scratchpad, !showingAppPanel, !showingSections, selectedMetric == nil else { return false }
         let pad = ScratchpadService.shared
-        let commandOnly = event.modifierFlags.intersection([.command, .control, .option, .shift]) == .command
-        guard let action = ScratchpadFocusedTabShortcut.action(charactersIgnoringModifiers: event.charactersIgnoringModifiers,
+        let commandOnly = event.modifierFlags.intersection([.command, .control, .option]) == .command
+        let shift = event.modifierFlags.contains(.shift)
+        guard let action = ScratchpadFocusedShortcut.action(charactersIgnoringModifiers: event.charactersIgnoringModifiers,
                                                                commandOnly: commandOnly,
+                                                               shift: shift,
                                                                canCreatePad: pad.canCreatePad,
                                                                canClosePad: pad.canClosePad) else {
             // At the tab limit Command-T still belongs to the pad, not the text.
-            return commandOnly && event.charactersIgnoringModifiers?.lowercased() == "t"
+            return commandOnly && !shift && event.charactersIgnoringModifiers?.lowercased() == "t"
         }
         switch action {
         case .createPad: pad.createPad(defaultName: FeatureStrings.scratchpad(L10n.shared.language).pageTitle)
         case .closeSelectedPad: scratchpadCloseSerial += 1
         case .hidePad: collapse()
+        case .find: requestScratchpadFind(.showFindInterface)
+        case .findNext: requestScratchpadFind(.nextMatch)
+        case .findPrevious: requestScratchpadFind(.previousMatch)
         }
         return true
+    }
+
+    /// The editor lives in the view, so the request goes out as a serial and
+    /// the view reads which of the finder's actions it was for.
+    private func requestScratchpadFind(_ action: NSTextFinder.Action) {
+        scratchpadFindAction = action
+        scratchpadFindSerial += 1
     }
 
     private func handleClipboardPasteKey(_ event: NSEvent) -> Bool {
@@ -2167,20 +2184,34 @@ final class NotchService: ObservableObject {
             }
             if event.type == .keyDown, event.window === self.panel, event.keyCode == 53 {
                 // A level being typed in the mixer cancels on Escape by
-                // itself; the island collapses on the next one.
+                // itself, and the scratchpad's find bar closes on it; the
+                // island collapses on the next one.
                 if let editor = self.panel?.firstResponder as? NSTextView, editor.isFieldEditor,
                    (editor.delegate as AnyObject?) is MixerPercentNativeTextField { return event }
+                if PlainTextEditor.findBarHasKeyboard(in: self.panel) { return event }
                 self.collapse()
                 return nil
             }
             let click = clicks.contains(NSEvent.EventTypeMask(rawValue: 1 << event.type.rawValue))
-            if click, event.window === self.panel { self.clickedSinceOpening = true }
-            if click, event.window !== self.panel, !self.keepsWorkingSurface,
+            let islandWindow = self.ownsWindow(event.window)
+            if click, islandWindow { self.clickedSinceOpening = true }
+            if click, !islandWindow, !self.keepsWorkingSurface,
                self.windowHost?.contains(NSEvent.mouseLocation) != true,
                (NSApp.delegate as? AppDelegate)?.isOverStatusItem(NSEvent.mouseLocation) != true,
                !AssistiveKeyboard.ownsCocoaPoint(NSEvent.mouseLocation) { self.collapse() }
             return event
         }) { eventMonitors.append(token) }
+    }
+
+    /// The panel and what hangs from it: a SwiftUI popover opened in the
+    /// island is a child window, so a click in it is not a click away.
+    private func ownsWindow(_ window: NSWindow?) -> Bool {
+        guard let window, let panel else { return false }
+        return sequence(first: window, next: { $0.parent }).contains { $0 === panel }
+    }
+
+    private func pointerOverChildWindow(_ point: CGPoint) -> Bool {
+        panel?.childWindows?.contains { $0.isVisible && $0.frame.contains(point) } == true
     }
 
     private func syncGestures() {
