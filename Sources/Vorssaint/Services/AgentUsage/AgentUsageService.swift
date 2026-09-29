@@ -209,10 +209,9 @@ final class AgentUsageService: ObservableObject {
             cursors.removeAll()
             // Prices first, so the first read is already priced.
             loadPrices()
-            // A slow or cloud-backed log must not hold the whole page behind
-            // its loading spinner. Publish the empty scaffold immediately;
-            // the completed history replaces it after the streaming pass.
-            publish()
+            // Keep the page loading until history is complete. Publishing an
+            // empty summary also makes the cache track every historical
+            // record as a change instead of building once after this pass.
             let roots = AgentLogRoot.all(home: home).filter { providers.contains($0.provider) }
             for file in AgentLogReader.discover(roots, since: Date().addingTimeInterval(-Self.horizon)) {
                 // A stop while reading leaves the rest for the next start.

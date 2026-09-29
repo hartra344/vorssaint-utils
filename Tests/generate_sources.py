@@ -1247,7 +1247,8 @@ def main():
           + "extension AgentUsageReadTests {\nfinal class Host: Fixture {\n"
           + "".join(declaration("Sources/Vorssaint/Services/AgentUsage/AgentUsageService.swift", prefix)
                     .replace("private func", "func", 1)
-                    for prefix in ["    private func read(", "    private func filesChanged("])
+                    .replace("func read(", "@discardableResult func read(", 1)
+                    for prefix in ["    private func start(", "    private func read(", "    private func filesChanged("])
           + "}\n}\n")
 
     # Same-file extensions can exercise the private AppKit content view without
