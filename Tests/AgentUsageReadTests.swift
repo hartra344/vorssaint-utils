@@ -4,12 +4,14 @@
 import Foundation
 
 typealias AgentUsageProductionLogReader = AgentLogReader
+typealias AgentUsageReadProductionArchive = AgentUsageArchive
 
 /// Runs the service's production startup/read methods, parser, cursor and store. The
 /// reader wrapper only observes when a complete line is handed to the service.
 enum AgentUsageReadTests {
     enum AgentLogReader {
         static var beforeLine: (() -> Void)?
+        static func isLog(_ path: String) -> Bool { AgentUsageProductionLogReader.isLog(path) }
         static func discover(_ roots: [AgentLogRoot], since horizon: Date) -> [(path: String, provider: AgentProvider)] {
             AgentUsageProductionLogReader.discover(roots, since: horizon)
         }
@@ -23,14 +25,22 @@ enum AgentUsageReadTests {
                 line($0)
             }
         }
-        static func readAppended(_ cursor: AgentLogCursor, shouldContinue: () -> Bool,
+        static func readAppended(_ cursor: AgentLogCursor, since horizon: Date = .distantPast, shouldContinue: () -> Bool,
                                  including: ((Data, Range<Int>) -> Bool)? = nil,
                                  line: (Data) -> Void) {
-            AgentUsageProductionLogReader.readAppended(cursor, shouldContinue: shouldContinue,
+            AgentUsageProductionLogReader.readAppended(cursor, since: horizon, shouldContinue: shouldContinue,
                                                         including: including) {
                 beforeLine?()
                 line($0)
             }
+        }
+    }
+
+    enum AgentUsageArchive {
+        static func load() -> AgentUsageReadProductionArchive.Contents? { nil }
+        static func resume(_ contents: AgentUsageReadProductionArchive.Contents, logs: Set<String>, since horizon: Date)
+            -> (store: AgentUsageStore, cursors: [String: AgentLogCursor], unchanged: Bool) {
+            AgentUsageReadProductionArchive.resume(contents, logs: logs, since: horizon)
         }
     }
 
@@ -50,7 +60,7 @@ enum AgentUsageReadTests {
     }
 
     class Fixture {
-        static let horizon: TimeInterval = 91 * 86_400
+        static let horizon = TimeInterval(AgentUsageSnapshot.dayCount) * 86_400
         let queue = Queue()
         var home = FileManager.default.temporaryDirectory
         var readerSession = 1
@@ -64,6 +74,9 @@ enum AgentUsageReadTests {
         var snapshot = AgentUsageSnapshot()
         var publications: [AgentUsageSnapshot] = []
         var events: [AgentUsageEvent] = []
+        var savedMark: Int?
+        var progressMark: Int { 0 }
+        func saveProgress() {}
         func startTimer() {}
         func loadPrices() {}
         func closeEndedTurns(_ roots: [AgentLogRoot], atLaunch: Bool) {}
@@ -128,6 +141,7 @@ enum AgentUsageReadTests {
                 switch provider {
                 case .claude: entries += AgentLogParser.parseClaude(line, state: &cursor.state, now: now)
                 case .codex: entries += AgentLogParser.parseCodex(line, state: &cursor.state, now: now)
+                case .opencode: entries += AgentLogParser.parseOpenCode(line, state: &cursor.state, now: now)
                 case .copilot: entries += AgentLogParser.parseCopilot(line, state: &cursor.state, now: now)
                 }
             }

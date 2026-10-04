@@ -92,8 +92,11 @@ enum SettingsDirectory {
             default: return item.destination.page == .monitor
             }
         }
+        // The companion lives in the island, and its settings in a tab of the
+        // island's page rather than a row of their own.
+        let islandPages: Set<SettingsSidebarItem.ID> = [.page(.notch)]
         let island = grouped.first(where: { $0.id == 4 })?.items.filter {
-            $0.id == .page(.notch)
+            islandPages.contains($0.id)
         } ?? []
         let sound: [SettingsSidebarItem] = essentials.items.filter { item in
             item.destination.page == .general
@@ -111,7 +114,9 @@ enum SettingsDirectory {
         ]
         let utilities = grouped.filter { $0.id == 4 }.map { section in
             SettingsSidebarSection(id: section.id, title: section.title,
-                                   items: section.items.filter { $0.id != .page(.notch) })
+                                   items: section.items.filter {
+                                       !islandPages.contains($0.id) && $0.id != .page(.notchMascot)
+                                   })
         }
         let remaining = grouped.filter { $0.id != 0 && $0.id != 4 }
         return [featured[0]] + utilities + featured.dropFirst().filter { !$0.items.isEmpty } + remaining
@@ -348,8 +353,9 @@ enum SettingsDirectory {
                                       icon: "macbook",
                                       keywords: [FeatureStrings.notch(language).description,
                                                  FeatureStrings.notchEditor(language).hideMenuBarIcon,
+                                                 FeatureStrings.notchActivities(language).keepAwakeActivity,
                                                  "notch", "camera", "music", "clipboard",
-                                                 FeatureStrings.notchAgents(language).title, "Claude", "Codex", "GitHub Copilot", "AI", "tokens",
+                                                 FeatureStrings.notchAgents(language).title, "Claude", "Codex", "OpenCode", "GitHub Copilot", "AI", "tokens",
                                                  FeatureStrings.notchAgents(language).resetsCard,
                                                  FeatureStrings.notchLockScreen(language).title,
                                                  FeatureStrings.notchLockScreen(language).sounds]
@@ -358,6 +364,10 @@ enum SettingsDirectory {
                                           + (NotchSupport.hasDisplayWithoutNotch
                                              ? [FeatureStrings.notch(language).withoutNotch,
                                                 FeatureStrings.notch(language).capsuleFit] : [])),
+                SettingsDirectoryItem(page: .notchMascot,
+                                      title: FeatureStrings.notchMascot(language).title,
+                                      icon: AppFeature.notchMascot.symbolName,
+                                      keywords: FeatureStrings.notchMascot(language).searchKeywords),
                 SettingsDirectoryItem(page: .commandBar,
                                       title: FeatureStrings.commandBar(language).pageTitle,
                                       icon: "command",

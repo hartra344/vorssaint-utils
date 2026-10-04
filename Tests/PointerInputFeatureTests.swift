@@ -9,6 +9,7 @@ import CoreGraphics
 import Darwin
 import Foundation
 import ImageIO
+import IOKit
 import VMStatisticsCompat
 
 enum PointerInputFeatureTests {
@@ -1382,6 +1383,8 @@ enum PointerInputFeatureTests {
                "auto-repeat never forces a manual maximize/minimize override")
         suite.expect(WindowDirectionalGestureSupport.shouldApplyKeyboardManualOverride(isAutorepeat: false),
                "a distinct Space, Return, or Up tap still maximizes while the ring is open")
+
+        MiddleClickTrackpadContract.run(suite)
 
         // MARK: Middle click tap (issue #161)
 
@@ -3151,6 +3154,49 @@ enum PointerInputFeatureTests {
                 && PreciseVolumeMediaKey.volumeDown.rollerDirection == .down
                 && PreciseVolumeMediaKey.mute.rollerDirection == nil,
                "precise volume only remaps volume up and down media keys")
+        var optionPress = PreciseVolumeKeyOwnership()
+        suite.expect(optionPress.leavesToSystem(keyCode: 0, isDown: true, isRepeat: false,
+                                                option: true, commandOrControl: false)
+                && optionPress.leavesToSystem(keyCode: 0, isDown: true, isRepeat: true,
+                                              option: false, commandOrControl: false)
+                && optionPress.leavesToSystem(keyCode: 0, isDown: false, isRepeat: false,
+                                              option: false, commandOrControl: false),
+               "precise volume leaves an Option press to the system until its release")
+        var commandPress = PreciseVolumeKeyOwnership()
+        suite.expect(commandPress.leavesToSystem(keyCode: 1, isDown: true, isRepeat: false,
+                                                 option: false, commandOrControl: true),
+               "precise volume leaves a Command or Control press to the system")
+        var plainPress = PreciseVolumeKeyOwnership()
+        suite.expect(!plainPress.leavesToSystem(keyCode: 0, isDown: true, isRepeat: false,
+                                                option: false, commandOrControl: false)
+                && !plainPress.leavesToSystem(keyCode: 0, isDown: true, isRepeat: true,
+                                              option: true, commandOrControl: false)
+                && !plainPress.leavesToSystem(keyCode: 0, isDown: false, isRepeat: false,
+                                              option: true, commandOrControl: false),
+               "precise volume keeps remapping a plain press when Option joins mid-press")
+        var unseenPress = PreciseVolumeKeyOwnership()
+        suite.expect(unseenPress.leavesToSystem(keyCode: 0, isDown: true, isRepeat: true,
+                                                option: true, commandOrControl: false)
+                && unseenPress.leavesToSystem(keyCode: 0, isDown: false, isRepeat: false,
+                                              option: true, commandOrControl: false),
+               "precise volume leaves a press whose key-down it never saw to the system")
+        var unseenPlainPress = PreciseVolumeKeyOwnership()
+        suite.expect(unseenPlainPress.leavesToSystem(keyCode: 1, isDown: true, isRepeat: true,
+                                                     option: false, commandOrControl: false)
+                && unseenPlainPress.leavesToSystem(keyCode: 1, isDown: false, isRepeat: false,
+                                                   option: false, commandOrControl: false),
+               "precise volume leaves unseen plain repeats and releases to the system")
+        var lostRelease = PreciseVolumeKeyOwnership()
+        _ = lostRelease.leavesToSystem(keyCode: 0, isDown: true, isRepeat: false,
+                                       option: true, commandOrControl: false)
+        suite.expect(!lostRelease.leavesToSystem(keyCode: 0, isDown: true, isRepeat: false,
+                                                 option: false, commandOrControl: false),
+               "precise volume remaps a fresh plain press even when the last release was lost")
+        let fineStep = PreciseVolumeKeyEvents.fineStep(0)
+        suite.expect(fineStep.count == 2 && fineStep.allSatisfy(PreciseVolumeKeyEvents.isPosted),
+               "precise volume marks its own fine-step events so its tap never counts them as a press")
+        suite.expect(CGEvent(source: nil).map { !PreciseVolumeKeyEvents.isPosted($0) } == true,
+               "a physical volume event is not taken for one precise volume posted")
 
         // MARK: Brightness key base (issue #370)
 
@@ -3365,6 +3411,18 @@ enum PointerInputFeatureTests {
         suite.expect(QuitProtectionSupport.usesNativeQuitRequest(for: .quit)
                 && !QuitProtectionSupport.usesNativeQuitRequest(for: .close),
                "quit confirmation asks the target app to terminate while close stays a window shortcut")
+        suite.expect(!QuitProtectionSupport.usesNativeQuitRequest(
+                    for: .quit, bundleIdentifier: "com.valvesoftware.steam"),
+               "a compatibility target sends synthetic keystrokes instead of native terminate")
+        suite.expect(QuitProtectionSupport.usesNativeQuitRequest(
+                    for: .quit, bundleIdentifier: "com.valvesoftware.steam.helper"),
+               "an unverified helper keeps using native terminate")
+        suite.expect(QuitProtectionSupport.usesNativeQuitRequest(
+                    for: .quit, bundleIdentifier: "com.example.steam"),
+               "a same-named unrelated app keeps using native terminate")
+        suite.expect(QuitProtectionSupport.usesNativeQuitRequest(
+                    for: .quit, bundleIdentifier: "com.example.editor"),
+               "an ordinary app continues using native terminate requests")
 
         suite.expect(QuitProtectionSupport.scopeAllows(.all, bundleIdentifier: nil, exceptions: []),
                "all-app scope protects even an app without a bundle identifier")
@@ -3520,5 +3578,178 @@ private final class PointerInputTestClock {
 
     func advance(by interval: TimeInterval) {
         lock.withLock { value += interval }
+    }
+}
+
+/// Runs the production lifecycle and notification callbacks with IOKit,
+/// MultitouchSupport and the event tap replaced by doubles.
+enum MiddleClickTrackpadContract {
+    static let middleClickContactCallback = "contact"
+    enum Multitouch {
+        static var devices: CFArray?
+        static func deviceList() -> CFArray? { devices }
+        static func register(_ device: UnsafeMutableRawPointer, _ callback: String?) {}
+        static func start(_ device: UnsafeMutableRawPointer) {}
+        static func stop(_ device: UnsafeMutableRawPointer) {}
+    }
+    enum PointerTapRunLoop {
+        static func remove(_ source: CFRunLoopSource, invalidating port: Int?) {}
+    }
+    enum EventTap {
+        static func tapEnable(tap: Int, enable: Bool) {}
+    }
+    enum Workspace {
+        static let shared = WorkspaceState()
+        struct WorkspaceState { let notificationCenter = NotificationCenter() }
+    }
+    enum IO {
+        struct Registration {
+            let notification: String
+            let callback: (UnsafeMutableRawPointer?, io_iterator_t) -> Void
+            let context: UnsafeMutableRawPointer?
+            let iterator: io_iterator_t
+        }
+        static var registrations: [Registration] = []
+        static var armed: Set<io_iterator_t> = []
+        static var released: [io_object_t] = []
+        static var destroyedPorts = 0
+        static var calls = 0
+        static var failAt: Int?
+        static func reset() {
+            registrations = []; armed = []; released = []
+            destroyedPorts = 0; calls = 0; failAt = nil
+        }
+        static func IONotificationPortCreate(_ port: mach_port_t) -> Int? { 1 }
+        static func IONotificationPortSetDispatchQueue(_ port: Int, _ queue: DispatchQueue) {}
+        static func IOServiceMatching(_ name: String) -> String { name }
+        static func IOServiceAddMatchingNotification(
+            _ port: Int, _ notification: String, _ matching: String,
+            _ callback: @escaping (UnsafeMutableRawPointer?, io_iterator_t) -> Void,
+            _ context: UnsafeMutableRawPointer?, _ iterator: inout io_iterator_t
+        ) -> kern_return_t {
+            calls += 1
+            if calls == failAt { return kIOReturnError }
+            iterator = io_iterator_t(calls)
+            registrations.append(Registration(notification: notification, callback: callback,
+                                               context: context, iterator: iterator))
+            return KERN_SUCCESS
+        }
+        static func IOIteratorNext(_ iterator: io_iterator_t) -> io_object_t {
+            armed.insert(iterator)
+            return 0
+        }
+        static func IOObjectRelease(_ object: io_object_t) { released.append(object) }
+        static func IONotificationPortDestroy(_ port: Int) {
+            destroyedPorts += 1
+            registrations = []
+        }
+        static func emit(_ notification: String) {
+            for registration in registrations where registration.notification == notification
+                && armed.remove(registration.iterator) != nil {
+                registration.callback(registration.context, registration.iterator)
+            }
+        }
+    }
+    class Fixture {
+        typealias CFMachPort = Int
+        typealias CGEvent = EventTap
+        typealias NSWorkspace = Workspace
+        typealias MiddleClickService = Service
+        var deviceList: CFArray?
+        var touchDeviceMissing = false
+        var isRunning = false
+        var tap: Int? = 1
+        var runLoopSource: CFRunLoopSource?
+        var observers: [Any] = []
+        var hotplugPort: Int?
+        var hotplugIterators: [io_iterator_t] = []
+        let tapStateLock = NSLock()
+        let stateLock = NSLock()
+        var lastTransformEnd: TimeInterval?
+        var suppressedButtonSequence = false
+        var fingerCount = 0
+        var lastFrameUptime: TimeInterval = 0
+        var fingerCountSince: TimeInterval = 0
+        func releaseHeldMiddleButton() {}
+        func resetTapCandidateLocked() {}
+    }
+
+    static func run(_ suite: TestSuite) {
+        IO.reset()
+        let service = Service()
+        Multitouch.devices = nil
+        service.startMultitouch()
+        service.installHotplugObserver()
+        service.installHotplugObserver()
+        suite.expect(service.touchDeviceMissing,
+                     "a started middle click without a touch device tells Settings the trackpad cannot be read")
+        suite.expect(Set(IO.registrations.map(\.notification))
+                        == [kIOFirstMatchNotification, kIOTerminatedNotification] && IO.calls == 2,
+                     "one observer is armed for arrivals and one for removals, without duplicate registration")
+        Multitouch.devices = [NSObject()] as CFArray
+        IO.emit(kIOFirstMatchNotification)
+        suite.expect(!service.touchDeviceMissing, "a touch device clears the missing trackpad warning")
+        IO.emit(kIOTerminatedNotification)
+        suite.expect(!service.touchDeviceMissing && service.deviceList != nil,
+                     "removing one device keeps the warning off when another trackpad remains")
+        Multitouch.devices = nil
+        IO.emit(kIOTerminatedNotification)
+        suite.expect(service.touchDeviceMissing && service.deviceList == nil,
+                     "removing the last trackpad runs the production callback and brings the warning back")
+        Multitouch.devices = [NSObject()] as CFArray
+        IO.emit(kIOFirstMatchNotification)
+        suite.expect(!service.touchDeviceMissing, "reconnecting a trackpad clears the warning again")
+        Multitouch.devices = nil
+        IO.emit(kIOFirstMatchNotification)
+        suite.expect(service.touchDeviceMissing,
+                     "an arrival delivered after a removal reads the current device list, not the old event")
+        let delayed = IO.registrations.first!
+        service.stop()
+        delayed.callback(delayed.context, delayed.iterator)
+        suite.expect(!service.touchDeviceMissing && service.deviceList == nil,
+                     "pausing middle click clears the warning and ignores queued device callbacks")
+        suite.expect(IO.released == [1, 2] && IO.destroyedPorts == 1
+                        && service.hotplugPort == nil && service.hotplugIterators.isEmpty,
+                     "stopping releases both notification iterators and their port")
+        for failure in [1, 2] {
+            IO.reset()
+            IO.failAt = failure
+            let unavailable = Service()
+            unavailable.installHotplugObserver()
+            suite.expect(unavailable.hotplugPort == nil && unavailable.hotplugIterators.isEmpty
+                            && IO.destroyedPorts == 1 && IO.released == (failure == 2 ? [1] : []),
+                         "a failed notification registration releases every resource already acquired")
+            unavailable.stop()
+        }
+        IO.reset()
+
+        let panel = Panel()
+        panel.middleClick.touchDeviceMissing = true
+        panel.middleClick.systemDragGestureConflict = true
+        suite.expect(panel.middleClickCaption == Strings.enUS.middleClickNoTrackpad,
+                     "the quick controls row says the trackpad cannot be read, ahead of the drag conflict")
+        panel.middleClick.touchDeviceMissing = false
+        suite.expect(panel.middleClickCaption == Strings.enUS.middleClickDragConflict,
+                     "the quick controls row falls back to the drag conflict once a trackpad is read")
+        panel.permissions.accessibility = false
+        panel.middleClick.touchDeviceMissing = true
+        suite.expect(panel.middleClickCaption.hasPrefix(Strings.enUS.permissionRequired),
+                     "a missing Accessibility grant still comes first")
+        panel.middleClickEnabled = false
+        suite.expect(panel.middleClickCaption == Strings.enUS.middleClickEnableCaption,
+                     "a disabled middle click does not show a missing-trackpad warning")
+    }
+
+    class PanelFixture {
+        struct Localizer { let s = Strings.enUS }
+        struct PermissionState { var accessibility = true }
+        final class MiddleClickState {
+            var touchDeviceMissing = false
+            var systemDragGestureConflict = false
+        }
+        let l10n = Localizer()
+        var permissions = PermissionState()
+        let middleClick = MiddleClickState()
+        var middleClickEnabled = true
     }
 }

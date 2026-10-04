@@ -47,6 +47,7 @@ enum CopilotAgentTests {
         accounting(suite)
         requestIdentity(suite)
         unresolvedModels(suite)
+        CopilotArchiveTests.run(suite)
     }
 
     private static func requestIdentity(_ suite: TestSuite) {
